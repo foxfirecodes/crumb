@@ -31,6 +31,7 @@ export interface ActionItem {
   assigneeKey: string | null;
   assignee: string | null;
   due: string | null;
+  url: string | null;
   messageIds: string[];
   createdAt: number;
 }
@@ -52,6 +53,7 @@ export interface CanonicalActionItem {
   assigneeKey: string | null;
   assignee: string | null;
   due: string | null;
+  url: string | null;
   priority: number;
   relevanceScore: number;
   firstSeenAt: number;

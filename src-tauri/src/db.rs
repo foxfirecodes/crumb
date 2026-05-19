@@ -47,6 +47,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0005_scrape_range.sql"),
         prepare: Some(prepare_scrape_range_migration),
     },
+    Migration {
+        id: "0006_action_urls",
+        sql: include_str!("../migrations/0006_action_urls.sql"),
+        prepare: Some(prepare_action_urls_migration),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -64,6 +69,7 @@ pub struct ActionCandidate {
     pub assignee_key: Option<String>,
     pub assignee: Option<String>,
     pub due: Option<String>,
+    pub url: Option<String>,
     pub message_ids: Vec<String>,
     pub dedupe_key: Option<String>,
     pub merge_with: Option<String>,
@@ -143,7 +149,7 @@ impl Db {
         let conn = self.inner.lock();
         let sql = format!(
             "SELECT a.id, a.title, a.status, a.source_kind, a.source_scope, a.source_label,
-                    a.assignee_key, a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
+                    a.assignee_key, a.assignee, a.due, a.url, a.priority, a.relevance_score, a.first_seen_at,
                     a.last_seen_at, a.completed_at, a.snoozed_until, a.latest_context,
                     COUNT(e.id) AS evidence_count
              FROM canonical_action_items a
@@ -256,7 +262,7 @@ impl Db {
 
         let action_items: Vec<_> = {
             let mut stmt = conn.prepare(
-                "SELECT id, scrape_id, text, assignee_key, assignee, due, message_ids, created_at
+                "SELECT id, scrape_id, text, assignee_key, assignee, due, url, message_ids, created_at
                  FROM action_items WHERE scrape_id = ? ORDER BY created_at",
             )?;
             let collected = stmt
@@ -310,7 +316,7 @@ impl Db {
         let conn = self.inner.lock();
         let mut stmt = conn.prepare(
             "SELECT a.id, a.title, a.status, a.source_kind, a.source_scope, a.source_label,
-                    a.assignee_key, a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
+                    a.assignee_key, a.assignee, a.due, a.url, a.priority, a.relevance_score, a.first_seen_at,
                     a.last_seen_at, a.completed_at, a.snoozed_until, a.latest_context,
                     COUNT(e.id) AS evidence_count
              FROM canonical_action_items a
@@ -503,19 +509,21 @@ impl Db {
                 assignee_key.as_deref(),
                 action.assignee.as_deref(),
                 action.due.as_deref(),
+                action.url.as_deref(),
                 action.dedupe_key.as_deref(),
                 action.merge_with.as_deref(),
                 &action.message_ids,
             )?;
             let item_key = format!("canonical:{canonical_id}");
             tx.execute(
-                "INSERT INTO action_items (id, scrape_id, text, assignee_key, assignee, due, message_ids, created_at, dedupe_key)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO action_items (id, scrape_id, text, assignee_key, assignee, due, url, message_ids, created_at, dedupe_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(scrape_id, dedupe_key) DO UPDATE SET
                    text = excluded.text,
                    assignee_key = COALESCE(excluded.assignee_key, action_items.assignee_key),
                    assignee = COALESCE(excluded.assignee, action_items.assignee),
                    due = COALESCE(excluded.due, action_items.due),
+                   url = COALESCE(excluded.url, action_items.url),
                    message_ids = excluded.message_ids",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
@@ -524,6 +532,7 @@ impl Db {
                     assignee_key.as_deref(),
                     action.assignee.as_deref(),
                     action.due.as_deref(),
+                    action.url.as_deref(),
                     ids,
                     now,
                     item_key
@@ -556,7 +565,7 @@ impl Db {
         let action = conn
             .query_row(
                 "SELECT a.id, a.title, a.status, a.source_kind, a.source_scope, a.source_label,
-                        a.assignee_key, a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
+                        a.assignee_key, a.assignee, a.due, a.url, a.priority, a.relevance_score, a.first_seen_at,
                         a.last_seen_at, a.completed_at, a.snoozed_until, a.latest_context,
                         COUNT(e.id) AS evidence_count
                  FROM canonical_action_items a
@@ -645,6 +654,12 @@ fn prepare_scrape_cursor_migration(conn: &rusqlite::Connection) -> Result<()> {
 fn prepare_scrape_range_migration(conn: &rusqlite::Connection) -> Result<()> {
     ensure_column(conn, "scrapes", "first_message_id", "TEXT")?;
     ensure_column(conn, "scrapes", "last_message_id", "TEXT")?;
+    Ok(())
+}
+
+fn prepare_action_urls_migration(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(conn, "action_items", "url", "TEXT")?;
+    ensure_column(conn, "canonical_action_items", "url", "TEXT")?;
     Ok(())
 }
 
@@ -769,7 +784,7 @@ fn row_to_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
 }
 
 fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionItem> {
-    let raw_ids: Option<String> = row.get(6)?;
+    let raw_ids: Option<String> = row.get(7)?;
     let message_ids: Vec<String> = raw_ids
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -781,8 +796,9 @@ fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionItem> {
         assignee_key: row.get(3)?,
         assignee: row.get(4)?,
         due: row.get(5)?,
+        url: row.get(6)?,
         message_ids,
-        created_at: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -797,14 +813,15 @@ fn row_to_canonical_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<Canonica
         assignee_key: row.get(6)?,
         assignee: row.get(7)?,
         due: row.get(8)?,
-        priority: row.get(9)?,
-        relevance_score: row.get(10)?,
-        first_seen_at: row.get(11)?,
-        last_seen_at: row.get(12)?,
-        completed_at: row.get(13)?,
-        snoozed_until: row.get(14)?,
-        latest_context: row.get(15)?,
-        evidence_count: row.get(16)?,
+        url: row.get(9)?,
+        priority: row.get(10)?,
+        relevance_score: row.get(11)?,
+        first_seen_at: row.get(12)?,
+        last_seen_at: row.get(13)?,
+        completed_at: row.get(14)?,
+        snoozed_until: row.get(15)?,
+        latest_context: row.get(16)?,
+        evidence_count: row.get(17)?,
     })
 }
 
@@ -819,6 +836,7 @@ fn upsert_canonical_action(
     assignee_key: Option<&str>,
     assignee: Option<&str>,
     due: Option<&str>,
+    url: Option<&str>,
     ai_dedupe_key: Option<&str>,
     merge_with: Option<&str>,
     message_ids: &[String],
@@ -833,6 +851,7 @@ fn upsert_canonical_action(
             assignee_key,
             assignee,
             due,
+            url,
         )?;
         insert_action_evidence(
             tx,
@@ -858,6 +877,7 @@ fn upsert_canonical_action(
             assignee_key,
             assignee,
             due,
+            url,
         )?;
         insert_action_evidence(
             tx,
@@ -881,9 +901,9 @@ fn upsert_canonical_action(
     tx.execute(
         "INSERT INTO canonical_action_items (
            id, title, status, source_kind, source_scope, source_label, dedupe_key,
-           assignee_key, assignee, due, priority, relevance_score, first_seen_at, last_seen_at, latest_context
+           assignee_key, assignee, due, url, priority, relevance_score, first_seen_at, last_seen_at, latest_context
          )
-         VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+         VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
          ON CONFLICT(source_kind, source_scope, dedupe_key) DO UPDATE SET
            last_seen_at = excluded.last_seen_at,
            source_label = excluded.source_label,
@@ -891,6 +911,7 @@ fn upsert_canonical_action(
            assignee_key = COALESCE(canonical_action_items.assignee_key, excluded.assignee_key),
            assignee = COALESCE(canonical_action_items.assignee, excluded.assignee),
            due = COALESCE(canonical_action_items.due, excluded.due),
+           url = COALESCE(canonical_action_items.url, excluded.url),
            title = CASE
              WHEN length(excluded.title) < length(canonical_action_items.title)
              THEN excluded.title
@@ -906,6 +927,7 @@ fn upsert_canonical_action(
             assignee_key,
             assignee,
             due,
+            url,
             now,
             now,
             text
@@ -943,6 +965,7 @@ fn update_canonical_action(
     assignee_key: Option<&str>,
     assignee: Option<&str>,
     due: Option<&str>,
+    url: Option<&str>,
 ) -> Result<()> {
     tx.execute(
         "UPDATE canonical_action_items
@@ -952,6 +975,7 @@ fn update_canonical_action(
              assignee_key = COALESCE(canonical_action_items.assignee_key, ?),
              assignee = COALESCE(canonical_action_items.assignee, ?),
              due = COALESCE(canonical_action_items.due, ?),
+             url = COALESCE(canonical_action_items.url, ?),
              title = CASE
                WHEN length(?) < length(canonical_action_items.title)
                THEN ?
@@ -965,6 +989,7 @@ fn update_canonical_action(
             assignee_key,
             assignee,
             due,
+            url,
             text,
             text,
             action_id
@@ -1424,6 +1449,7 @@ mod tests {
                 assignee_key: None,
                 assignee: None,
                 due: None,
+                url: None,
                 message_ids: vec!["message-2".into()],
                 dedupe_key: Some("verify-old-dbs-migrate".into()),
                 merge_with: None,
@@ -1444,7 +1470,8 @@ mod tests {
                 "0002_action_item_dedupe",
                 "0003_assignee_keys",
                 "0004_scrape_cursor",
-                "0005_scrape_range"
+                "0005_scrape_range",
+                "0006_action_urls"
             ]
         );
 
@@ -1526,7 +1553,8 @@ mod tests {
                 "0002_action_item_dedupe",
                 "0003_assignee_keys",
                 "0004_scrape_cursor",
-                "0005_scrape_range"
+                "0005_scrape_range",
+                "0006_action_urls"
             ]
         );
 
@@ -1559,6 +1587,7 @@ mod tests {
                 assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: None,
+                url: None,
                 message_ids: vec!["message-1".into()],
                 dedupe_key: Some("ship menu bar ux".into()),
                 merge_with: None,
@@ -1585,6 +1614,7 @@ mod tests {
                 assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: None,
+                url: None,
                 message_ids: vec!["message-1".into()],
                 dedupe_key: Some("ship menu bar ux".into()),
                 merge_with: None,
@@ -1625,6 +1655,7 @@ mod tests {
                 assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: Some("Friday".into()),
+                url: None,
                 message_ids: vec!["message-1".into()],
                 dedupe_key: Some("send-launch-checklist".into()),
                 merge_with: None,
@@ -1669,6 +1700,7 @@ mod tests {
                 assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: None,
+                url: Some("https://github.com/example/repo/pull/123".into()),
                 message_ids: vec!["message-1".into()],
                 dedupe_key: Some("review-launch-plan".into()),
                 merge_with: None,
@@ -1676,6 +1708,10 @@ mod tests {
         )?;
 
         let action_id = db.list_open_action_items()?[0].id.clone();
+        assert_eq!(
+            db.list_open_action_items()?[0].url.as_deref(),
+            Some("https://github.com/example/repo/pull/123")
+        );
         let updated = db.set_action_assignee(&action_id, None, Some("Arthur Tang"))?;
         assert_eq!(updated.assignee.as_deref(), Some("Arthur Tang"));
         assert_eq!(updated.assignee_key.as_deref(), Some("person:arthur-tang"));
@@ -1753,6 +1789,7 @@ mod tests {
                 assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: Some("today".into()),
+                url: None,
                 message_ids: vec!["100".into()],
                 dedupe_key: Some("retest-source-scraping".into()),
                 merge_with: None,
@@ -1815,6 +1852,7 @@ mod tests {
                 assignee_key: Some("discord:user:arthur".into()),
                 assignee: Some("Arthur Tang".into()),
                 due: Some("this week".into()),
+                url: None,
                 message_ids: vec!["message-2".into()],
                 dedupe_key: Some("partner-user-ids-for-whitelisting".into()),
                 merge_with: None,
@@ -1848,6 +1886,7 @@ mod tests {
                     assignee_key: Some("discord:user:arthur".into()),
                     assignee: Some("Arthur Tang".into()),
                     due: Some("this week".into()),
+                    url: None,
                     message_ids: vec!["message-2".into()],
                     dedupe_key: Some("partner-user-ids-for-experiment".into()),
                     merge_with: None,
@@ -1857,6 +1896,7 @@ mod tests {
                     assignee_key: Some("discord:user:anthony".into()),
                     assignee: Some("Anthony".into()),
                     due: Some("today".into()),
+                    url: None,
                     message_ids: vec!["message-3".into()],
                     dedupe_key: Some("add-screenshots-to-partner-docs".into()),
                     merge_with: None,

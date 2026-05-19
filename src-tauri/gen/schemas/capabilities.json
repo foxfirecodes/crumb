@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"Default permissions for the Crumb popover window.","local":true,"windows":["popover"],"permissions":["core:default","core:event:default","core:window:allow-show","core:window:allow-hide","core:window:allow-set-position","core:window:allow-set-focus","core:webview:allow-set-webview-focus"]}}

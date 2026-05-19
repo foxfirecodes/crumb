@@ -18,6 +18,7 @@ interface Props {
   onStatusFilterChange: (filter: ActionItemStatusFilter) => void;
   onPersonFilterChange: (key: string) => void;
   onSourceOpen: (item: CanonicalActionItem) => void;
+  onUrlOpen: (url: string) => void;
   onAssigneeChange: (
     id: string,
     assignee: string | null,
@@ -45,6 +46,7 @@ export function ActionList({
   onStatusFilterChange,
   onPersonFilterChange,
   onSourceOpen,
+  onUrlOpen,
   onAssigneeChange,
   onDismiss,
   onRestore,
@@ -163,6 +165,23 @@ export function ActionList({
                       <span>{item.evidenceCount} sightings</span>
                     )}
                     <span>{formatTime(item.lastSeenAt)}</span>
+                    {item.url && (
+                      <a
+                        className="action-list__pr-link"
+                        href={item.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          const url = item.url;
+                          if (url) onUrlOpen(url);
+                        }}
+                        onKeyDown={(event) => event.stopPropagation()}
+                      >
+                        PR
+                      </a>
+                    )}
                   </div>
                 </div>
                 <button
@@ -210,6 +229,7 @@ export function ActionList({
                     );
                   }}
                   onSourceOpen={() => onSourceOpen(item)}
+                  onUrlOpen={onUrlOpen}
                 />
               )}
             </li>
@@ -227,6 +247,7 @@ function ActionItemDetails({
   onAssigneeDraftChange,
   onAssigneeSave,
   onSourceOpen,
+  onUrlOpen,
 }: {
   item: CanonicalActionItem;
   assigneeDraft: string;
@@ -234,6 +255,7 @@ function ActionItemDetails({
   onAssigneeDraftChange: (value: string) => void;
   onAssigneeSave: () => void;
   onSourceOpen: () => void;
+  onUrlOpen: (url: string) => void;
 }) {
   const assigneeChanged = assigneeDraft.trim() !== (item.assignee ?? "");
 
@@ -245,6 +267,24 @@ function ActionItemDetails({
           {item.sourceLabel ?? item.sourceKind}
         </button>
       </div>
+      {item.url && (
+        <div className="action-list__detail-row">
+          <span>PR</span>
+          <a
+            className="action-list__source"
+            href={item.url}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(event) => {
+              event.preventDefault();
+              const url = item.url;
+              if (url) onUrlOpen(url);
+            }}
+          >
+            {item.url}
+          </a>
+        </div>
+      )}
       <div className="action-list__detail-grid">
         <div>
           <span>Due</span>

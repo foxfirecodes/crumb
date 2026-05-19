@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::discord::NormalizedMessage;
+use crate::discord::{NormalizedMessage, NormalizedPerson};
 use crate::events::{CanonicalActionItem, Decision};
 
 const DEFAULT_ACP_AGENT_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.33.1";
@@ -30,9 +30,13 @@ Rules:
 - Treat wording variations as duplicates when the owner, object, and outcome are substantially the same. Example: "provide partner user IDs for whitelisting" and "send Lew partner user IDs to add to the experiment" are the same task.
 - Deduplicate within this response too. Return one action item per real-world task and one decision per real-world decision.
 - For action item "text", produce a concise canonical title. If "merge_with" is set, prefer the existing title unless the new wording is clearly better.
-- You receive known_people_json with stable Discord user keys. If an action item's responsible party matches a known person by name, username, author, or @ mention, set "assignee_key" to that person's key and "assignee" to their display name.
+- You receive current_user_json for the signed-in Discord user and known_people_json with stable Discord user keys. If an action item's responsible party matches a known person by name, username, author, or @ mention, set "assignee_key" to that person's key and "assignee" to their display name.
 - If the responsible party is a team or group, set "assignee_key" to "team:" plus a stable lowercase slug. If it is an unknown individual, use "person:" plus a stable lowercase slug. Leave both assignee fields null only when no responsible party is stated.
 - For "due", preserve any explicit target date, target day, deadline, or timeframe from the source, including relative values like "today", "this week", or "next Friday". Leave it null only when no target date/timeframe is stated.
+- For PR notification action items where the next action is to merge a PR, resolve a merge queue failure, or address human review/BugBot feedback, assign the item to current_user_json.
+- If a PR has an approval notification and there is no later merge queue success or successfully merged notification for the same PR in this transcript, create an action item to merge the PR.
+- For PR review or BugBot feedback, summarize the requested changes into a short action title and put the PR URL in "url" when present. Do not copy full raw review text into the title.
+- For PR notifications, prefer one action item per review or feedback batch, not one per individual comment. Use a new stable dedupe_key for each subsequent distinct human review or BugBot feedback event.
 - For decisions, quote the original wording in "context"; do not paraphrase the evidence.
 - "dedupe_key" must be stable across repeated scrapes. Use a short lowercase semantic key, not a hash and not a sentence copy.
 - For repeated evidence from the same Discord messages, reuse the same "message_ids".
@@ -46,7 +50,7 @@ Rules:
     { "text": "string", "context": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
   ],
   "action_items": [
-    { "text": "string", "assignee": "string", "assignee_key": "string", "due": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
+    { "text": "string", "assignee": "string", "assignee_key": "string", "due": "string", "url": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
   ]
 }"#;
 
@@ -72,6 +76,8 @@ pub struct ExtractedActionItem {
     pub assignee_key: Option<String>,
     #[serde(default, alias = "target_date", alias = "targetDate")]
     pub due: Option<String>,
+    #[serde(default, alias = "pr_url", alias = "prUrl", alias = "html_url")]
+    pub url: Option<String>,
     #[serde(default)]
     pub message_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -100,6 +106,7 @@ pub async fn extract(
     messages: &[NormalizedMessage],
     existing_actions: &[CanonicalActionItem],
     existing_decisions: &[Decision],
+    current_user: Option<&NormalizedPerson>,
 ) -> Result<ExtractionResult> {
     if messages.is_empty() {
         return Ok(ExtractionResult {
@@ -113,7 +120,7 @@ pub async fn extract(
 
     let response = run_acp_prompt(
         agent,
-        build_prompt(messages, existing_actions, existing_decisions)?,
+        build_prompt(messages, existing_actions, existing_decisions, current_user)?,
     )
     .await?;
     let json = extract_json_object(&response).with_context(|| {
@@ -261,6 +268,7 @@ fn build_prompt(
     messages: &[NormalizedMessage],
     existing_actions: &[CanonicalActionItem],
     existing_decisions: &[Decision],
+    current_user: Option<&NormalizedPerson>,
 ) -> Result<String> {
     let existing_actions = existing_actions
         .iter()
@@ -272,10 +280,13 @@ fn build_prompt(
         .collect::<Vec<_>>();
     let existing_actions = serde_json::to_string(&existing_actions)?;
     let existing_decisions = serde_json::to_string(&existing_decisions)?;
-    let known_people = serde_json::to_string(&known_people_from_messages(messages))?;
+    let current_user = current_user.map(current_user_for_prompt);
+    let current_user_json = serde_json::to_string(&current_user)?;
+    let known_people =
+        serde_json::to_string(&known_people_from_messages(messages, current_user.as_ref()))?;
 
     Ok(format!(
-        "{SYSTEM_PROMPT}\n\nAnalyze this Discord source transcript and extract decisions, action items, and a summary. Use the existing records to merge duplicates rather than creating new variants.\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript>\n{}\n</transcript>",
+        "{SYSTEM_PROMPT}\n\nAnalyze this Discord source transcript and extract decisions, action items, and a summary. Use the existing records to merge duplicates rather than creating new variants.\n\n<current_user_json>\n{current_user_json}\n</current_user_json>\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript>\n{}\n</transcript>",
         format_transcript(messages)
     ))
 }
@@ -398,6 +409,7 @@ struct ExistingActionForPrompt<'a> {
     assignee_key: Option<&'a str>,
     assignee: Option<&'a str>,
     due: Option<&'a str>,
+    url: Option<&'a str>,
     latest_context: Option<&'a str>,
 }
 
@@ -410,6 +422,7 @@ impl<'a> From<&'a CanonicalActionItem> for ExistingActionForPrompt<'a> {
             assignee_key: item.assignee_key.as_deref(),
             assignee: item.assignee.as_deref(),
             due: item.due.as_deref(),
+            url: item.url.as_deref(),
             latest_context: item.latest_context.as_deref(),
         }
     }
@@ -435,7 +448,7 @@ impl<'a> From<&'a Decision> for ExistingDecisionForPrompt<'a> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct KnownPersonForPrompt {
     key: String,
@@ -444,8 +457,15 @@ struct KnownPersonForPrompt {
     aliases: Vec<String>,
 }
 
-fn known_people_from_messages(messages: &[NormalizedMessage]) -> Vec<KnownPersonForPrompt> {
+fn known_people_from_messages(
+    messages: &[NormalizedMessage],
+    current_user: Option<&KnownPersonForPrompt>,
+) -> Vec<KnownPersonForPrompt> {
     let mut people: BTreeMap<String, KnownPersonForPrompt> = BTreeMap::new();
+
+    if let Some(current_user) = current_user {
+        people.insert(current_user.key.clone(), current_user.clone());
+    }
 
     for message in messages {
         people.entry(message.author_key.clone()).or_insert_with(|| {
@@ -470,6 +490,21 @@ fn known_people_from_messages(messages: &[NormalizedMessage]) -> Vec<KnownPerson
     }
 
     people.into_values().collect()
+}
+
+fn current_user_for_prompt(user: &NormalizedPerson) -> KnownPersonForPrompt {
+    let mut person = person_for_prompt(
+        &user.key,
+        &user.display_name,
+        &user.username,
+        Some(&user.id),
+    );
+    person.aliases.push("me".into());
+    person.aliases.push("myself".into());
+    person.aliases.push("current user".into());
+    person.aliases.sort();
+    person.aliases.dedup();
+    person
 }
 
 fn person_for_prompt(

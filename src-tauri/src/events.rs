@@ -48,6 +48,7 @@ pub struct ActionItem {
     pub assignee_key: Option<String>,
     pub assignee: Option<String>,
     pub due: Option<String>,
+    pub url: Option<String>,
     #[serde(rename = "messageIds")]
     pub message_ids: Vec<String>,
     #[serde(rename = "createdAt")]
@@ -69,6 +70,7 @@ pub struct CanonicalActionItem {
     pub assignee_key: Option<String>,
     pub assignee: Option<String>,
     pub due: Option<String>,
+    pub url: Option<String>,
     pub priority: i64,
     #[serde(rename = "relevanceScore")]
     pub relevance_score: f64,

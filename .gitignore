@@ -16,6 +16,7 @@ vite.config.d.ts
 # rust
 src-tauri/target/
 !src-tauri/binaries/.gitkeep
+src-tauri/gen/
 
 # os
 .DS_Store

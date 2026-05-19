@@ -45,6 +45,7 @@ SQLite database in app data dir
 - The main Actions view lists `inbox` and `active`; dismissed view lists `done` and `archived`.
 - `assignee` is display text. `assignee_key` is the stable filter key.
 - Discord user assignee keys use `discord:user:{id}` when possible. Unknown people fall back to `person:{slug}`; groups can be `team:{slug}`.
+- Action items can carry a `url`; PR review notifications use this for a direct pull request link.
 - `scrapes.first_message_id` and `scrapes.last_message_id` store the fetched Discord message range. Repeated scrapes fetch the requested recent window and process only messages outside the stored range.
 - The frontend persists the selected assignee/person filter in `localStorage` under `crumb.personFilter`.
 - Source deletion intentionally deletes the source's canonical action items/evidence too, so re-scraping can be tested from scratch.
@@ -55,8 +56,10 @@ SQLite database in app data dir
 - `ExtractedActionItem.due` accepts `due`, `target_date`, and `targetDate`.
 - The extractor is told to preserve relative due values like `today`, `this week`, or `next Friday`.
 - Existing canonical actions are sent to the extractor so it can return `merge_with`.
-- Known Discord people are derived from message authors and mentions and passed as `known_people_json`.
+- The signed-in Discord user from `/users/@me` is passed as `current_user_json`; known Discord people are derived from message authors and mentions and passed as `known_people_json`.
 - Discord embeds and components are summarized into transcript text so notification-style messages with empty `content` can still produce action items.
+- PR URLs are requested from the extractor and also recovered deterministically from message/embed/component text when the extractor omits them. PR-linked action items are assigned to the signed-in user.
+- Approval notifications get a deterministic merge fallback: if a PR has an approval and no later merge-success notification in the scraped messages, Crumb creates a merge action item.
 - ACP/Claude sessions are configured to disable tools and keep extraction constrained to JSON output.
 
 ## UI Notes

@@ -388,7 +388,7 @@ impl InteractionReply {
 pub struct DiscordScraper {
     http: reqwest::Client,
     token: String,
-    user: Option<String>,
+    self_user: NormalizedPerson,
 }
 
 impl DiscordScraper {
@@ -401,20 +401,28 @@ impl DiscordScraper {
             .send()
             .await
             .context("checking Discord user token")?;
-        let user = if response.status().is_success() {
+        let self_user = if response.status().is_success() {
             let user: ApiUser = response.json().await.context("parsing Discord user")?;
-            Some(format_user_tag(&user))
+            normalize_person(&user)
         } else {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             bail!("Discord user token rejected ({status}): {text}");
         };
 
-        Ok(Self { http, token, user })
+        Ok(Self {
+            http,
+            token,
+            self_user,
+        })
     }
 
     pub fn user(&self) -> Option<String> {
-        self.user.clone()
+        Some(self.self_user.display_name.clone())
+    }
+
+    pub fn self_user(&self) -> NormalizedPerson {
+        self.self_user.clone()
     }
 
     pub async fn fetch_channel_messages<F>(

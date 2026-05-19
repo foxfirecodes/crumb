@@ -275,6 +275,16 @@ body {
   color: var(--fg-muted);
 }
 
+.action-list__pr-link {
+  color: var(--fg-dim);
+  text-decoration: none;
+}
+
+.action-list__pr-link:hover {
+  color: var(--fg);
+  text-decoration: underline;
+}
+
 .action-list__details {
   margin: 10px 0 0 26px;
   padding: 10px;

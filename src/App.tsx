@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   deleteSource,
   getScrape,
@@ -169,6 +170,10 @@ export default function App() {
     setView("sources");
   };
 
+  const openActionUrl = (url: string) => {
+    openUrl(url).catch(console.error);
+  };
+
   const removeSource = (id: string) => {
     if (pendingDeleteId !== id) {
       setPendingDeleteId(id);
@@ -225,6 +230,7 @@ export default function App() {
             onStatusFilterChange={setActionStatusFilter}
             onPersonFilterChange={changePersonFilter}
             onSourceOpen={openActionSource}
+            onUrlOpen={openActionUrl}
             onAssigneeChange={changeActionAssignee}
             onDismiss={dismissAction}
             onRestore={restoreAction}
