@@ -34,6 +34,32 @@ export interface ActionItem {
   createdAt: number;
 }
 
+export type CanonicalActionStatus =
+  | "inbox"
+  | "active"
+  | "snoozed"
+  | "done"
+  | "archived";
+
+export interface CanonicalActionItem {
+  id: string;
+  title: string;
+  status: CanonicalActionStatus;
+  sourceKind: "discord" | "asana" | "manual" | "mixed";
+  sourceScope: string;
+  sourceLabel: string | null;
+  assignee: string | null;
+  due: string | null;
+  priority: number;
+  relevanceScore: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  completedAt: number | null;
+  snoozedUntil: number | null;
+  latestContext: string | null;
+  evidenceCount: number;
+}
+
 export interface ScrapeDetail {
   scrape: ScrapeSummary;
   decisions: Decision[];

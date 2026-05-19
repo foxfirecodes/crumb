@@ -210,6 +210,9 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
             ) {
                 Ok(updated) => {
                     let _ = app.emit("scrape:updated", &updated);
+                    if let Ok(actions) = db.list_open_action_items() {
+                        let _ = app.emit("actions:updated", &actions);
+                    }
                     let _ = req
                         .reply
                         .send(format!(

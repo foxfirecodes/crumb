@@ -1,10 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ScrapeDetail, ScrapeSummary, SidecarStatus } from "./types";
+import type {
+  CanonicalActionItem,
+  CanonicalActionStatus,
+  ScrapeDetail,
+  ScrapeSummary,
+  SidecarStatus,
+} from "./types";
 
 export const listScrapes = () => invoke<ScrapeSummary[]>("list_scrapes");
 export const getScrape = (id: string) =>
   invoke<ScrapeDetail | null>("get_scrape", { id });
+export const listActionItems = () =>
+  invoke<CanonicalActionItem[]>("list_action_items");
+export const setActionItemStatus = (
+  id: string,
+  status: CanonicalActionStatus,
+) => invoke<CanonicalActionItem>("set_action_item_status", { id, status });
 export const getSidecarStatus = () => invoke<SidecarStatus>("get_sidecar_status");
 export const hidePopover = () => invoke<void>("hide_popover");
 
@@ -20,3 +32,8 @@ export const onSidecarStatus = (
   cb: (s: SidecarStatus) => void,
 ): Promise<UnlistenFn> =>
   listen<SidecarStatus>("sidecar:status", (e) => cb(e.payload));
+
+export const onActionsUpdated = (
+  cb: (items: CanonicalActionItem[]) => void,
+): Promise<UnlistenFn> =>
+  listen<CanonicalActionItem[]>("actions:updated", (e) => cb(e.payload));

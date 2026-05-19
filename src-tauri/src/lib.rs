@@ -10,6 +10,7 @@ mod events;
 mod runtime;
 
 use tauri::{
+    image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Position, Rect, Size,
@@ -31,6 +32,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_scrapes,
             commands::get_scrape,
+            commands::list_action_items,
+            commands::set_action_item_status,
             commands::get_sidecar_status,
             commands::hide_popover,
         ])
@@ -53,8 +56,9 @@ pub fn run() {
                 ])
                 .build()?;
 
+            let tray_icon = Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().cloned().unwrap())
+                .icon(tray_icon)
                 .icon_as_template(true)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)

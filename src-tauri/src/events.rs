@@ -53,6 +53,36 @@ pub struct ActionItem {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CanonicalActionItem {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(rename = "sourceKind")]
+    pub source_kind: String,
+    #[serde(rename = "sourceScope")]
+    pub source_scope: String,
+    #[serde(rename = "sourceLabel")]
+    pub source_label: Option<String>,
+    pub assignee: Option<String>,
+    pub due: Option<String>,
+    pub priority: i64,
+    #[serde(rename = "relevanceScore")]
+    pub relevance_score: f64,
+    #[serde(rename = "firstSeenAt")]
+    pub first_seen_at: i64,
+    #[serde(rename = "lastSeenAt")]
+    pub last_seen_at: i64,
+    #[serde(rename = "completedAt")]
+    pub completed_at: Option<i64>,
+    #[serde(rename = "snoozedUntil")]
+    pub snoozed_until: Option<i64>,
+    #[serde(rename = "latestContext")]
+    pub latest_context: Option<String>,
+    #[serde(rename = "evidenceCount")]
+    pub evidence_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ScrapeDetail {
     pub scrape: ScrapeSummary,
     pub decisions: Vec<Decision>,
