@@ -1,0 +1,25 @@
+# env
+.env
+.env.local
+
+# node
+node_modules/
+dist/
+.vite/
+
+# bun
+.bun/
+
+# rust
+src-tauri/target/
+src-tauri/binaries/crumb-sidecar-*
+!src-tauri/binaries/.gitkeep
+
+# os
+.DS_Store
+*.log
+
+# editors
+.idea/
+.vscode/
+*.swp
