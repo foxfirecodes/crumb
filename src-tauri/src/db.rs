@@ -37,6 +37,16 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0003_assignee_keys.sql"),
         prepare: Some(prepare_assignee_keys_migration),
     },
+    Migration {
+        id: "0004_scrape_cursor",
+        sql: include_str!("../migrations/0004_scrape_cursor.sql"),
+        prepare: Some(prepare_scrape_cursor_migration),
+    },
+    Migration {
+        id: "0005_scrape_range",
+        sql: include_str!("../migrations/0005_scrape_range.sql"),
+        prepare: Some(prepare_scrape_range_migration),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -57,6 +67,12 @@ pub struct ActionCandidate {
     pub message_ids: Vec<String>,
     pub dedupe_key: Option<String>,
     pub merge_with: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScrapeMessageRange {
+    pub first_message_id: Option<String>,
+    pub last_message_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -168,6 +184,44 @@ impl Db {
         drop(conn);
         self.get_canonical_action(id)?
             .context("action item vanished after status update")
+    }
+
+    pub fn set_action_assignee(
+        &self,
+        id: &str,
+        assignee_key: Option<&str>,
+        assignee: Option<&str>,
+    ) -> Result<CanonicalActionItem> {
+        let assignee = assignee.map(str::trim).filter(|value| !value.is_empty());
+        let assignee_key = stable_assignee_key(assignee_key, assignee);
+        let conn = self.inner.lock();
+        conn.execute(
+            "UPDATE canonical_action_items
+             SET assignee_key = ?, assignee = ?
+             WHERE id = ?",
+            rusqlite::params![assignee_key.as_deref(), assignee, id],
+        )?;
+        drop(conn);
+        self.get_canonical_action(id)?
+            .context("action item vanished after assignee update")
+    }
+
+    pub fn scraped_message_range(&self, scrape_id: &str) -> Result<ScrapeMessageRange> {
+        let conn = self.inner.lock();
+        let range = conn
+            .query_row(
+                "SELECT first_message_id, last_message_id FROM scrapes WHERE id = ?",
+                [scrape_id],
+                |row| {
+                    Ok(ScrapeMessageRange {
+                        first_message_id: row.get(0)?,
+                        last_message_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(range)
     }
 
     pub fn get_scrape(&self, id: &str) -> Result<Option<ScrapeDetail>> {
@@ -330,6 +384,8 @@ impl Db {
     pub fn mark_extracted(
         &self,
         scrape_id: &str,
+        first_message_id: Option<&str>,
+        last_message_id: Option<&str>,
         message_count: i64,
         summary: &str,
         decisions: &[DecisionCandidate],
@@ -354,8 +410,37 @@ impl Db {
             format_source_label(guild_name.as_deref(), channel_name.as_deref(), &channel_id);
 
         tx.execute(
-            "UPDATE scrapes SET status='extracted', message_count=?, summary=?, error=NULL WHERE id=?",
-            rusqlite::params![message_count, summary, scrape_id],
+            "UPDATE scrapes
+             SET status='extracted',
+                message_count=?,
+                 summary=?,
+                 error=NULL,
+                 first_message_id=CASE
+                   WHEN ? IS NULL THEN first_message_id
+                   WHEN first_message_id IS NULL THEN ?
+                   WHEN CAST(? AS INTEGER) < CAST(first_message_id AS INTEGER) THEN ?
+                   ELSE first_message_id
+                 END,
+                 last_message_id=CASE
+                   WHEN ? IS NULL THEN last_message_id
+                   WHEN last_message_id IS NULL THEN ?
+                   WHEN CAST(? AS INTEGER) > CAST(last_message_id AS INTEGER) THEN ?
+                   ELSE last_message_id
+                 END
+             WHERE id=?",
+            rusqlite::params![
+                message_count,
+                summary,
+                first_message_id,
+                first_message_id,
+                first_message_id,
+                first_message_id,
+                last_message_id,
+                last_message_id,
+                last_message_id,
+                last_message_id,
+                scrape_id
+            ],
         )?;
         for decision in decisions {
             let ids = serde_json::to_string(&decision.message_ids)?;
@@ -549,6 +634,17 @@ fn prepare_assignee_keys_migration(conn: &rusqlite::Connection) -> Result<()> {
     ensure_column(conn, "canonical_action_items", "assignee_key", "TEXT")?;
     backfill_assignee_keys(conn, "action_items")?;
     backfill_assignee_keys(conn, "canonical_action_items")?;
+    Ok(())
+}
+
+fn prepare_scrape_cursor_migration(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(conn, "scrapes", "last_message_id", "TEXT")?;
+    Ok(())
+}
+
+fn prepare_scrape_range_migration(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(conn, "scrapes", "first_message_id", "TEXT")?;
+    ensure_column(conn, "scrapes", "last_message_id", "TEXT")?;
     Ok(())
 }
 
@@ -1312,6 +1408,8 @@ mod tests {
         )?;
         db.mark_extracted(
             "discord:legacy-channel",
+            Some("message-1"),
+            Some("message-2"),
             1,
             "summary",
             &[DecisionCandidate {
@@ -1341,7 +1439,13 @@ mod tests {
         let applied = applied_migrations(&conn)?;
         assert_eq!(
             applied,
-            vec!["0001_init", "0002_action_item_dedupe", "0003_assignee_keys"]
+            vec![
+                "0001_init",
+                "0002_action_item_dedupe",
+                "0003_assignee_keys",
+                "0004_scrape_cursor",
+                "0005_scrape_range"
+            ]
         );
 
         let _ = std::fs::remove_file(db_path);
@@ -1417,7 +1521,13 @@ mod tests {
         let applied = applied_migrations(&conn)?;
         assert_eq!(
             applied,
-            vec!["0001_init", "0002_action_item_dedupe", "0003_assignee_keys"]
+            vec![
+                "0001_init",
+                "0002_action_item_dedupe",
+                "0003_assignee_keys",
+                "0004_scrape_cursor",
+                "0005_scrape_range"
+            ]
         );
 
         let _ = std::fs::remove_file(db_path);
@@ -1439,6 +1549,8 @@ mod tests {
         )?;
         db.mark_extracted(
             "scrape-1",
+            Some("message-1"),
+            Some("message-1"),
             1,
             "summary",
             &[],
@@ -1463,6 +1575,8 @@ mod tests {
         )?;
         db.mark_extracted(
             "scrape-2",
+            Some("message-1"),
+            Some("message-1"),
             1,
             "summary",
             &[],
@@ -1501,6 +1615,8 @@ mod tests {
         )?;
         db.mark_extracted(
             "scrape-1",
+            Some("message-1"),
+            Some("message-1"),
             1,
             "summary",
             &[],
@@ -1529,6 +1645,90 @@ mod tests {
     }
 
     #[test]
+    fn action_assignee_can_be_updated() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-action-assignee-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "scrape-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "scrape-1",
+            Some("message-1"),
+            Some("message-1"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Review launch plan".into(),
+                assignee_key: Some("discord:user:fox".into()),
+                assignee: Some("fox".into()),
+                due: None,
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("review-launch-plan".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let action_id = db.list_open_action_items()?[0].id.clone();
+        let updated = db.set_action_assignee(&action_id, None, Some("Arthur Tang"))?;
+        assert_eq!(updated.assignee.as_deref(), Some("Arthur Tang"));
+        assert_eq!(updated.assignee_key.as_deref(), Some("person:arthur-tang"));
+
+        let updated = db.set_action_assignee(&action_id, None, Some(""))?;
+        assert_eq!(updated.assignee, None);
+        assert_eq!(updated.assignee_key, None);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_scrapes_expand_message_range() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-scrape-range-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("100"),
+            Some("200"),
+            1,
+            "summary",
+            &[],
+            &[],
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("50"),
+            Some("250"),
+            1,
+            "summary",
+            &[],
+            &[],
+        )?;
+
+        let range = db.scraped_message_range("discord:channel-1")?;
+        assert_eq!(range.first_message_id.as_deref(), Some("50"));
+        assert_eq!(range.last_message_id.as_deref(), Some("250"));
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
     fn deleting_source_removes_its_actions() -> Result<()> {
         let db_path =
             std::env::temp_dir().join(format!("crumb-delete-source-{}.db", uuid::Uuid::new_v4()));
@@ -1543,6 +1743,8 @@ mod tests {
         )?;
         db.mark_extracted(
             "discord:channel-1",
+            Some("100"),
+            Some("100"),
             1,
             "summary",
             &[],
@@ -1551,13 +1753,25 @@ mod tests {
                 assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: Some("today".into()),
-                message_ids: vec!["message-1".into()],
+                message_ids: vec!["100".into()],
                 dedupe_key: Some("retest-source-scraping".into()),
                 merge_with: None,
             }],
         )?;
 
         assert_eq!(db.list_scrapes()?.len(), 1);
+        assert_eq!(
+            db.scraped_message_range("discord:channel-1")?
+                .first_message_id
+                .as_deref(),
+            Some("100")
+        );
+        assert_eq!(
+            db.scraped_message_range("discord:channel-1")?
+                .last_message_id
+                .as_deref(),
+            Some("100")
+        );
         assert_eq!(db.list_open_action_items()?.len(), 1);
 
         db.delete_source("discord:channel-1")?;
@@ -1585,6 +1799,8 @@ mod tests {
         )?;
         db.mark_extracted(
             "discord:channel-1",
+            Some("message-1"),
+            Some("message-2"),
             1,
             "first summary",
             &[DecisionCandidate {
@@ -1615,6 +1831,8 @@ mod tests {
         )?;
         db.mark_extracted(
             "discord:channel-1",
+            Some("message-1"),
+            Some("message-3"),
             2,
             "second summary",
             &[DecisionCandidate {

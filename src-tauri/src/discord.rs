@@ -31,6 +31,8 @@ pub struct NormalizedMessage {
     pub timestamp: String,
     pub reply_to_id: Option<String>,
     pub attachments: Vec<String>,
+    pub embeds: Vec<String>,
+    pub components: Vec<String>,
     pub mentions: Vec<NormalizedPerson>,
 }
 
@@ -280,10 +282,23 @@ impl DiscordBot {
                     .unwrap_or_else(|| "unknown".into());
 
                 let channel_id = interaction.channel_id;
+                let channel_name = match format_interaction_channel_name(
+                    interaction.channel.as_ref(),
+                    interaction.guild_id.as_ref(),
+                ) {
+                    Some(name) => Some(name),
+                    None => self
+                        .fetch_channel_name(&channel_id, interaction.guild_id.as_ref())
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("failed to fetch channel metadata: {e}");
+                            None
+                        }),
+                };
                 let req = ScrapeRequest {
                     scrape_id: format!("discord:{channel_id}"),
                     channel_id,
-                    channel_name: interaction.channel.and_then(|c| c.name),
+                    channel_name,
                     guild_id: interaction.guild_id,
                     guild_name: interaction.guild.and_then(|g| g.name),
                     triggered_by: user,
@@ -322,6 +337,24 @@ impl DiscordBot {
             .context("deferring Discord interaction")?;
 
         expect_success(response).await
+    }
+
+    async fn fetch_channel_name(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&String>,
+    ) -> Result<Option<String>> {
+        let url = format!("{DISCORD_API}/channels/{channel_id}");
+        let response = self
+            .http
+            .get(url)
+            .header(AUTHORIZATION, bot_auth(&self.token))
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .send()
+            .await
+            .context("fetching Discord channel metadata")?;
+        let channel: PartialChannel = parse_json_response(response).await?;
+        Ok(format_interaction_channel_name(Some(&channel), guild_id))
     }
 }
 
@@ -393,7 +426,7 @@ impl DiscordScraper {
     where
         F: FnMut(usize),
     {
-        let mut messages = Vec::new();
+        let mut messages: Vec<NormalizedMessage> = Vec::new();
         let mut before: Option<String> = None;
         let mut remaining = limit.clamp(1, 1000);
 
@@ -510,6 +543,8 @@ struct InteractionOption {
 struct PartialChannel {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    recipients: Vec<ApiUser>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,6 +580,10 @@ struct ApiMessage {
     #[serde(default)]
     attachments: Vec<ApiAttachment>,
     #[serde(default)]
+    embeds: Vec<Value>,
+    #[serde(default)]
+    components: Vec<Value>,
+    #[serde(default)]
     mentions: Vec<ApiUser>,
 }
 
@@ -571,9 +610,37 @@ impl From<ApiMessage> for NormalizedMessage {
             timestamp: value.timestamp,
             reply_to_id: value.message_reference.and_then(|r| r.message_id),
             attachments: value.attachments.into_iter().map(|a| a.url).collect(),
+            embeds: value.embeds.iter().filter_map(summarize_embed).collect(),
+            components: value
+                .components
+                .iter()
+                .filter_map(summarize_component)
+                .collect(),
             mentions: value.mentions.iter().map(normalize_person).collect(),
         }
     }
+}
+
+fn format_interaction_channel_name(
+    channel: Option<&PartialChannel>,
+    guild_id: Option<&String>,
+) -> Option<String> {
+    let channel = channel?;
+    if guild_id.is_none() {
+        if !channel.recipients.is_empty() {
+            let recipients = channel
+                .recipients
+                .iter()
+                .map(format_user_tag)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(format!("{recipients} (DM)"));
+        }
+        if let Some(name) = channel.name.as_deref().filter(|name| !name.is_empty()) {
+            return Some(format!("{name} (DM)"));
+        }
+    }
+    channel.name.clone()
 }
 
 fn normalize_person(user: &ApiUser) -> NormalizedPerson {
@@ -597,6 +664,86 @@ fn format_user_tag(user: &ApiUser) -> String {
             .cloned()
             .or_else(|| (!user.username.is_empty()).then(|| user.username.clone()))
             .unwrap_or_else(|| user.id.clone()),
+    }
+}
+
+fn summarize_embed(embed: &Value) -> Option<String> {
+    let object = embed.as_object()?;
+    let mut parts = Vec::new();
+    if let Some(author) = object
+        .get("author")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+    {
+        parts.push(author.to_string());
+    }
+    for key in ["title", "description", "url"] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            parts.push(value.to_string());
+        }
+    }
+    if let Some(fields) = object.get("fields").and_then(Value::as_array) {
+        for field in fields {
+            let Some(field_object) = field.as_object() else {
+                continue;
+            };
+            let name = field_object.get("name").and_then(Value::as_str);
+            let value = field_object.get("value").and_then(Value::as_str);
+            match (name, value) {
+                (Some(name), Some(value)) => parts.push(format!("{name}: {value}")),
+                (Some(name), None) => parts.push(name.to_string()),
+                (None, Some(value)) => parts.push(value.to_string()),
+                (None, None) => {}
+            }
+        }
+    }
+    if let Some(footer) = object
+        .get("footer")
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+    {
+        parts.push(footer.to_string());
+    }
+    clean_summary(parts.join(" | "))
+}
+
+fn summarize_component(component: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_component_text(component, &mut parts);
+    clean_summary(parts.join(" | "))
+}
+
+fn collect_component_text(component: &Value, parts: &mut Vec<String>) {
+    if let Some(object) = component.as_object() {
+        for key in ["label", "custom_id", "url", "placeholder"] {
+            if let Some(value) = object.get(key).and_then(Value::as_str) {
+                parts.push(value.to_string());
+            }
+        }
+        if let Some(options) = object.get("options").and_then(Value::as_array) {
+            for option in options {
+                collect_component_text(option, parts);
+            }
+        }
+        if let Some(children) = object.get("components").and_then(Value::as_array) {
+            for child in children {
+                collect_component_text(child, parts);
+            }
+        }
+    }
+}
+
+fn clean_summary(value: String) -> Option<String> {
+    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        None
+    } else if cleaned.len() > 1800 {
+        Some(format!(
+            "{}...",
+            cleaned.chars().take(1800).collect::<String>()
+        ))
+    } else {
+        Some(cleaned)
     }
 }
 

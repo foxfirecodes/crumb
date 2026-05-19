@@ -9,6 +9,7 @@ import {
   onScrapeNew,
   onScrapeUpdated,
   onSidecarStatus,
+  setActionItemAssignee,
   setActionItemStatus,
 } from "./lib/ipc";
 import type {
@@ -81,6 +82,12 @@ export default function App() {
     getScrape(selectedId).then(setDetail).catch(console.error);
   }, [selectedId, scrapes]);
 
+  useEffect(() => {
+    if (!pendingDeleteId) return;
+    const timeout = window.setTimeout(() => setPendingDeleteId(null), 5000);
+    return () => window.clearTimeout(timeout);
+  }, [pendingDeleteId]);
+
   const personOptions = useMemo(() => {
     const people = new Map<string, { key: string; label: string; count: number }>();
     for (const action of actions) {
@@ -146,6 +153,22 @@ export default function App() {
       .catch(console.error);
   };
 
+  const changeActionAssignee = (
+    id: string,
+    assignee: string | null,
+    assigneeKey: string | null,
+  ) => {
+    setActionItemAssignee(id, assignee, assigneeKey)
+      .then(refreshActions)
+      .catch(console.error);
+  };
+
+  const openActionSource = (item: CanonicalActionItem) => {
+    if (item.sourceKind !== "discord") return;
+    setSelectedId(`${item.sourceKind}:${item.sourceScope}`);
+    setView("sources");
+  };
+
   const removeSource = (id: string) => {
     if (pendingDeleteId !== id) {
       setPendingDeleteId(id);
@@ -201,6 +224,8 @@ export default function App() {
             personOptions={personOptions}
             onStatusFilterChange={setActionStatusFilter}
             onPersonFilterChange={changePersonFilter}
+            onSourceOpen={openActionSource}
+            onAssigneeChange={changeActionAssignee}
             onDismiss={dismissAction}
             onRestore={restoreAction}
           />

@@ -51,6 +51,23 @@ pub fn set_action_item_status(
 }
 
 #[tauri::command]
+pub fn set_action_item_assignee(
+    id: String,
+    assignee_key: Option<String>,
+    assignee: Option<String>,
+    app: AppHandle,
+    db: State<'_, Db>,
+) -> Result<CanonicalActionItem, String> {
+    let updated = db
+        .set_action_assignee(&id, assignee_key.as_deref(), assignee.as_deref())
+        .map_err(|e| e.to_string())?;
+    if let Ok(items) = db.list_open_action_items() {
+        let _ = app.emit("actions:updated", &items);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
 pub fn get_sidecar_status(handle: State<'_, RuntimeHandle>) -> SidecarStatus {
     handle.status()
 }

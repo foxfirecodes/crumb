@@ -1,15 +1,28 @@
+import { useState } from "react";
 import type {
   CanonicalActionItem,
   ActionItemStatusFilter,
 } from "../lib/types";
 
+interface PersonOption {
+  key: string;
+  label: string;
+  count: number;
+}
+
 interface Props {
   actions: CanonicalActionItem[];
   statusFilter: ActionItemStatusFilter;
   personFilter: string;
-  personOptions: Array<{ key: string; label: string; count: number }>;
+  personOptions: PersonOption[];
   onStatusFilterChange: (filter: ActionItemStatusFilter) => void;
   onPersonFilterChange: (key: string) => void;
+  onSourceOpen: (item: CanonicalActionItem) => void;
+  onAssigneeChange: (
+    id: string,
+    assignee: string | null,
+    assigneeKey: string | null,
+  ) => void;
   onDismiss: (id: string) => void;
   onRestore: (id: string) => void;
 }
@@ -31,10 +44,19 @@ export function ActionList({
   personOptions,
   onStatusFilterChange,
   onPersonFilterChange,
+  onSourceOpen,
+  onAssigneeChange,
   onDismiss,
   onRestore,
 }: Props) {
   const isDismissed = statusFilter === "dismissed";
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [assigneeDrafts, setAssigneeDrafts] = useState<Record<string, string>>(
+    {},
+  );
+  const toggleExpanded = (id: string) => {
+    setExpandedId((current) => (current === id ? null : id));
+  };
 
   return (
     <div className="actions">
@@ -94,39 +116,174 @@ export function ActionList({
         <ul className="action-list">
           {actions.map((item) => (
             <li key={item.id} className="action-list__item">
-              {isDismissed ? (
+              <div
+                className="action-list__row"
+                role="button"
+                tabIndex={0}
+                onClick={() => toggleExpanded(item.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    toggleExpanded(item.id);
+                  }
+                }}
+              >
+                {isDismissed ? (
+                  <button
+                    className="action-list__restore"
+                    title="Restore"
+                    aria-label={`Restore "${item.title}"`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onRestore(item.id);
+                    }}
+                    onKeyDown={(event) => event.stopPropagation()}
+                  >
+                    Restore
+                  </button>
+                ) : (
+                  <button
+                    className="action-list__check"
+                    title="Dismiss"
+                    aria-label={`Dismiss "${item.title}"`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onDismiss(item.id);
+                    }}
+                    onKeyDown={(event) => event.stopPropagation()}
+                  />
+                )}
+                <div className="action-list__body">
+                  <div className="action-list__title-row">
+                    <div className="action-list__title">{item.title}</div>
+                  </div>
+                  <div className="action-list__meta">
+                    {item.assignee && <span>{item.assignee}</span>}
+                    {item.evidenceCount > 1 && (
+                      <span>{item.evidenceCount} sightings</span>
+                    )}
+                    <span>{formatTime(item.lastSeenAt)}</span>
+                  </div>
+                </div>
                 <button
-                  className="action-list__restore"
-                  title="Restore"
-                  aria-label={`Restore "${item.title}"`}
-                  onClick={() => onRestore(item.id)}
+                  className="action-list__expand"
+                  title={expandedId === item.id ? "Collapse" : "Expand details"}
+                  aria-label={
+                    expandedId === item.id
+                      ? `Collapse "${item.title}"`
+                      : `Expand "${item.title}"`
+                  }
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    toggleExpanded(item.id);
+                  }}
+                  onKeyDown={(event) => event.stopPropagation()}
                 >
-                  Restore
+                  {expandedId === item.id ? "▾" : "▸"}
                 </button>
-              ) : (
-                <button
-                  className="action-list__check"
-                  title="Dismiss"
-                  aria-label={`Dismiss "${item.title}"`}
-                  onClick={() => onDismiss(item.id)}
+              </div>
+              {expandedId === item.id && (
+                <ActionItemDetails
+                  item={item}
+                  assigneeDraft={assigneeDrafts[item.id] ?? item.assignee ?? ""}
+                  personOptions={personOptions}
+                  onAssigneeDraftChange={(value) =>
+                    setAssigneeDrafts((drafts) => ({
+                      ...drafts,
+                      [item.id]: value,
+                    }))
+                  }
+                  onAssigneeSave={() => {
+                    const assignee = (
+                      assigneeDrafts[item.id] ??
+                      item.assignee ??
+                      ""
+                    ).trim();
+                    const option = personOptions.find(
+                      (person) =>
+                        person.label.toLowerCase() === assignee.toLowerCase(),
+                    );
+                    onAssigneeChange(
+                      item.id,
+                      assignee || null,
+                      assignee ? option?.key ?? null : null,
+                    );
+                  }}
+                  onSourceOpen={() => onSourceOpen(item)}
                 />
               )}
-              <div className="action-list__body">
-                <div className="action-list__title">{item.title}</div>
-                <div className="action-list__meta">
-                  <span>{item.sourceLabel ?? item.sourceKind}</span>
-                  {item.assignee && <span>{item.assignee}</span>}
-                  {item.due && <span>due {item.due}</span>}
-                  {item.evidenceCount > 1 && (
-                    <span>{item.evidenceCount} sightings</span>
-                  )}
-                  <span>{formatTime(item.lastSeenAt)}</span>
-                </div>
-              </div>
             </li>
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+function ActionItemDetails({
+  item,
+  assigneeDraft,
+  personOptions,
+  onAssigneeDraftChange,
+  onAssigneeSave,
+  onSourceOpen,
+}: {
+  item: CanonicalActionItem;
+  assigneeDraft: string;
+  personOptions: PersonOption[];
+  onAssigneeDraftChange: (value: string) => void;
+  onAssigneeSave: () => void;
+  onSourceOpen: () => void;
+}) {
+  const assigneeChanged = assigneeDraft.trim() !== (item.assignee ?? "");
+
+  return (
+    <div className="action-list__details">
+      <div className="action-list__detail-row">
+        <span>Source</span>
+        <button className="action-list__source" onClick={onSourceOpen}>
+          {item.sourceLabel ?? item.sourceKind}
+        </button>
+      </div>
+      <div className="action-list__detail-grid">
+        <div>
+          <span>Due</span>
+          <strong>{item.due || "No due date"}</strong>
+        </div>
+        <div>
+          <span>Status</span>
+          <strong>{item.status}</strong>
+        </div>
+        <div>
+          <span>First seen</span>
+          <strong>{formatTime(item.firstSeenAt)}</strong>
+        </div>
+        <div>
+          <span>Last seen</span>
+          <strong>{formatTime(item.lastSeenAt)}</strong>
+        </div>
+      </div>
+      {item.latestContext && (
+        <div className="action-list__context">{item.latestContext}</div>
+      )}
+      <div className="action-list__assignee">
+        <label htmlFor={`assignee-${item.id}`}>Assignee</label>
+        <input
+          id={`assignee-${item.id}`}
+          list="action-assignees"
+          value={assigneeDraft}
+          placeholder="Unassigned"
+          onChange={(event) => onAssigneeDraftChange(event.currentTarget.value)}
+        />
+        <datalist id="action-assignees">
+          {personOptions.map((person) => (
+            <option key={person.key} value={person.label} />
+          ))}
+        </datalist>
+        <button disabled={!assigneeChanged} onClick={onAssigneeSave}>
+          Save
+        </button>
+      </div>
     </div>
   );
 }

@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::ai;
 use crate::db::{ActionCandidate, Db, DecisionCandidate};
-use crate::discord::{DiscordBot, DiscordScraper, ScrapeRequest};
+use crate::discord::{DiscordBot, DiscordScraper, NormalizedMessage, ScrapeRequest};
 use crate::events::SidecarStatus;
 
 #[derive(Clone)]
@@ -168,11 +168,27 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
     };
 
     let result = async {
+        let scraped_range = db
+            .scraped_message_range(&req.scrape_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to load scrape range: {e}");
+                Default::default()
+            });
         let messages = scraper
             .fetch_channel_messages(&req.channel_id, req.limit, |fetched| {
                 tracing::debug!("progress {}: {}", req.scrape_id, fetched);
             })
             .await?;
+        let messages = messages
+            .into_iter()
+            .filter(|message| {
+                is_outside_scraped_range(
+                    message,
+                    scraped_range.first_message_id.as_deref(),
+                    scraped_range.last_message_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
 
         let _ = req
             .reply
@@ -232,6 +248,8 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
 
             match db.mark_extracted(
                 &req.scrape_id,
+                messages.first().map(|message| message.id.as_str()),
+                messages.last().map(|message| message.id.as_str()),
                 messages.len() as i64,
                 &extracted.summary,
                 &decisions,
@@ -268,6 +286,30 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
             emit_failed(&app, &db, &req.scrape_id, &user_msg);
             let _ = req.reply.send(format!("Scrape failed: {user_msg}")).await;
         }
+    }
+}
+
+fn is_outside_scraped_range(
+    message: &NormalizedMessage,
+    first_message_id: Option<&str>,
+    last_message_id: Option<&str>,
+) -> bool {
+    match (first_message_id, last_message_id) {
+        (Some(first), Some(last)) => {
+            compare_snowflake_ids(&message.id, first).is_lt()
+                || compare_snowflake_ids(&message.id, last).is_gt()
+        }
+        (Some(first), None) => compare_snowflake_ids(&message.id, first).is_lt(),
+        (None, Some(last)) => compare_snowflake_ids(&message.id, last).is_gt(),
+        (None, None) => true,
+    }
+}
+
+fn compare_snowflake_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    let parsed = a.parse::<u128>().ok().zip(b.parse::<u128>().ok());
+    match parsed {
+        Some((a, b)) => a.cmp(&b),
+        None => a.cmp(b),
     }
 }
 

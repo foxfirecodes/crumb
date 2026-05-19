@@ -35,6 +35,7 @@ pub fn run() {
             commands::delete_source,
             commands::list_action_items,
             commands::set_action_item_status,
+            commands::set_action_item_assignee,
             commands::get_sidecar_status,
             commands::hide_popover,
         ])

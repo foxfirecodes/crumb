@@ -508,9 +508,27 @@ fn format_transcript(messages: &[NormalizedMessage]) -> String {
             } else {
                 format!(" [+{} attachment(s)]", m.attachments.len())
             };
+            let embeds = if m.embeds.is_empty() {
+                String::new()
+            } else {
+                format!(" [embeds: {}]", m.embeds.join(" || "))
+            };
+            let components = if m.components.is_empty() {
+                String::new()
+            } else {
+                format!(" [components: {}]", m.components.join(" || "))
+            };
             format!(
-                "[{}] [{}] <{} | {}>{}{}: {}",
-                m.timestamp, m.id, m.author, m.author_key, reply, attachments, m.content
+                "[{}] [{}] <{} | {}>{}{}{}{}: {}",
+                m.timestamp,
+                m.id,
+                m.author,
+                m.author_key,
+                reply,
+                attachments,
+                embeds,
+                components,
+                m.content
             )
         })
         .collect::<Vec<_>>()

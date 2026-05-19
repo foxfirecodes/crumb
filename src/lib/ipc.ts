@@ -20,6 +20,16 @@ export const setActionItemStatus = (
   id: string,
   status: CanonicalActionStatus,
 ) => invoke<CanonicalActionItem>("set_action_item_status", { id, status });
+export const setActionItemAssignee = (
+  id: string,
+  assignee: string | null,
+  assigneeKey: string | null,
+) =>
+  invoke<CanonicalActionItem>("set_action_item_assignee", {
+    id,
+    assignee,
+    assigneeKey,
+  });
 export const getSidecarStatus = () => invoke<SidecarStatus>("get_sidecar_status");
 export const hidePopover = () => invoke<void>("hide_popover");
 
