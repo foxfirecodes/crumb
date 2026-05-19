@@ -1,6 +1,6 @@
 // Reads Discord credentials from `.env` (next to the app binary in dev,
 // next to the bundle's resource dir in prod). Returns `Ok((bot, app_id, user))`
-// where each may be None if the .env entry is empty; the sidecar will reject
+// where each may be None if the .env entry is empty; the runtime rejects
 // requests that require missing creds.
 
 use anyhow::{Context, Result};
@@ -16,8 +16,8 @@ pub fn load_discord_env(
         return Ok((None, None, None));
     }
 
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
 
     let mut bot = None;
     let mut app_id = None;
@@ -56,6 +56,9 @@ fn locate_env_file(app: &AppHandle) -> Result<PathBuf> {
         return Ok(cwd.join(".env"));
     }
 
-    let dir = app.path().app_data_dir().context("resolving app data dir")?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .context("resolving app data dir")?;
     Ok(dir.join(".env"))
 }

@@ -6,13 +6,15 @@
 node_modules/
 dist/
 .vite/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 
 # bun
 .bun/
 
 # rust
 src-tauri/target/
-src-tauri/binaries/crumb-sidecar-*
 !src-tauri/binaries/.gitkeep
 
 # os

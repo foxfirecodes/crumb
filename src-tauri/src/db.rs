@@ -28,7 +28,8 @@ impl Db {
         let conn = rusqlite::Connection::open(path).context("opening sqlite")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(MIGRATION_SQL).context("running migration")?;
+        conn.execute_batch(MIGRATION_SQL)
+            .context("running migration")?;
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })
@@ -62,7 +63,9 @@ impl Db {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let Some(scrape) = summary else { return Ok(None) };
+        let Some(scrape) = summary else {
+            return Ok(None);
+        };
 
         let decisions: Vec<_> = {
             let mut stmt = conn.prepare(

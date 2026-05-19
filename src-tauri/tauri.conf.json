@@ -54,7 +54,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/crumb-sidecar"],
     "macOS": {
       "minimumSystemVersion": "11.0"
     }

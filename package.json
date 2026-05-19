@@ -7,14 +7,12 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "sidecar:build": "cd sidecar && bun run build",
     "tauri": "tauri",
-    "tauri:dev": "bun run sidecar:build && tauri dev",
-    "tauri:build": "bun run sidecar:build && tauri build"
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
-    "@tauri-apps/plugin-shell": "^2.2.0",
     "@tauri-apps/plugin-sql": "^2.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

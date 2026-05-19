@@ -53,7 +53,7 @@ This is the new (post–2024) Discord feature that lets a slash command run anyw
 
 1. Go to the **Bot** tab in the sidebar.
 2. Under **Privileged Gateway Intents**, enable:
-   - ✅ **Message Content Intent** (needed so the bot can read message content in any guild context it operates in — even though we mostly use the user token to read, this keeps options open).
+   - No privileged intents are required for the MVP. The bot only receives slash-command interactions; message history is read separately with your user token.
 3. Under **Token**, click **Reset Token** and copy the value once. This is your `DISCORD_BOT_TOKEN`. **Discord shows this exactly once.** Save it immediately into your `.env`.
 
 ### 1.4 Public key (informational)
@@ -100,7 +100,7 @@ DISCORD_BOT_TOKEN=…
 DISCORD_USER_TOKEN=…
 ```
 
-> **No `ANTHROPIC_API_KEY` needed.** Crumb's Claude Agent SDK call piggybacks on your existing Claude Code login. As long as `claude` is on your `PATH` and authenticated (try `claude --version` in a terminal), the sidecar will use it.
+> **No `ANTHROPIC_API_KEY` needed.** Crumb is an ACP client. By default it connects to Claude Code through the pinned command `npx -y @agentclientprotocol/claude-agent-acp@0.33.1`, which reuses your existing Claude Code auth. Set `CRUMB_ACP_AGENT_COMMAND` if you want to point at an already-installed ACP agent binary.
 
 Make sure `.env` is gitignored before you put real values in. Crumb will refuse to start if any Discord vars are missing or look obviously malformed.
 

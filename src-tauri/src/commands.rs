@@ -4,7 +4,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::db::Db;
 use crate::events::{ScrapeDetail, ScrapeSummary, SidecarStatus};
-use crate::sidecar::SidecarHandle;
+use crate::runtime::RuntimeHandle;
 
 #[tauri::command]
 pub fn list_scrapes(db: State<'_, Db>) -> Result<Vec<ScrapeSummary>, String> {
@@ -17,7 +17,7 @@ pub fn get_scrape(id: String, db: State<'_, Db>) -> Result<Option<ScrapeDetail>,
 }
 
 #[tauri::command]
-pub fn get_sidecar_status(handle: State<'_, SidecarHandle>) -> SidecarStatus {
+pub fn get_sidecar_status(handle: State<'_, RuntimeHandle>) -> SidecarStatus {
     handle.status()
 }
 

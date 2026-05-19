@@ -1,11 +1,13 @@
-// Crumb shell: tray icon, popover window, sidecar lifecycle, SQLite,
+// Crumb shell: tray icon, popover window, Rust runtime, SQLite,
 // and the IPC surface for the React frontend.
 
+mod ai;
 mod commands;
 mod db;
+mod discord;
 mod env;
 mod events;
-mod sidecar;
+mod runtime;
 
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
@@ -19,13 +21,13 @@ use tracing_subscriber::EnvFilter;
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,crumb=debug")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,crumb=debug")),
         )
         .with_writer(std::io::stderr)
         .init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             commands::list_scrapes,
             commands::get_scrape,
@@ -41,7 +43,7 @@ pub fn run() {
             let database = db::Db::open(&db_path)?;
             app.manage(database.clone());
 
-            let handle = sidecar::spawn(app.handle().clone(), database)?;
+            let handle = runtime::spawn(app.handle().clone(), database)?;
             app.manage(handle);
 
             let tray_menu = MenuBuilder::new(app)
@@ -159,7 +161,7 @@ fn show_popover_centered(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn graceful_exit(app: &AppHandle) {
-    if let Some(handle) = app.try_state::<sidecar::SidecarHandle>() {
+    if let Some(handle) = app.try_state::<runtime::RuntimeHandle>() {
         let h = handle.inner().clone();
         tauri::async_runtime::spawn(async move { h.shutdown().await });
     }

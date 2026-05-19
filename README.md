@@ -56,8 +56,8 @@ Both interfaces are equal citizens — same data, same AI, different surfaces.
 ## Tech Stack
 
 - **Menubar app**: Tauri (Rust + web frontend)
-- **Discord bot**: Node.js / discord.js
-- **AI**: Claude API (Anthropic)
+- **Discord bot**: Rust in the Tauri process, using Discord Gateway + REST directly
+- **AI**: Agent Client Protocol Rust SDK via the Claude ACP connector
 - **Data sources**: Notion API, Discord API, Asana API
 
 ## Scope
