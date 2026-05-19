@@ -1,18 +1,24 @@
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::async_runtime;
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, watch};
+use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use crate::ai;
-use crate::db::{ActionCandidate, Db, DecisionCandidate};
+use crate::db::{ActionCandidate, Db, DecisionCandidate, WatchedChannel};
 use crate::discord::{
-    DiscordBot, DiscordScraper, NormalizedMessage, NormalizedPerson, ScrapeRequest,
+    DiscordBot, DiscordCommand, DiscordScraper, NormalizedMessage, NormalizedPerson, ScrapeRequest,
+    WatchRequest,
 };
-use crate::events::SidecarStatus;
+use crate::events::{ScrapeSummary, SidecarStatus};
+
+const WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const WATCH_FETCH_LIMIT: usize = 100;
 
 #[derive(Clone)]
 pub struct RuntimeHandle {
@@ -94,9 +100,9 @@ async fn run(
     let bot = DiscordBot::new(app_id.clone(), bot_token);
     bot.register_commands().await?;
 
-    let (scrape_tx, scrape_rx) = mpsc::unbounded_channel();
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    async_runtime::spawn(bot.run(scrape_tx, shutdown_rx.clone(), ready_tx));
+    async_runtime::spawn(bot.run(command_tx, shutdown_rx.clone(), ready_tx));
 
     let ready = tokio::time::timeout(Duration::from_secs(30), ready_rx)
         .await
@@ -111,16 +117,32 @@ async fn run(
         &app,
     );
 
-    scrape_loop(app.clone(), db, scraper, scrape_rx, shutdown_rx).await;
+    let (work_tx, work_rx) = mpsc::unbounded_channel();
+    async_runtime::spawn(command_queue_loop(
+        command_rx,
+        work_tx.clone(),
+        shutdown_rx.clone(),
+    ));
+    async_runtime::spawn(watch_scheduler_loop(
+        db.clone(),
+        work_tx,
+        shutdown_rx.clone(),
+    ));
+    work_loop(app.clone(), db, scraper, work_rx, shutdown_rx).await;
     handle.set_status(SidecarStatus::Disconnected, &app);
     Ok(())
 }
 
-async fn scrape_loop(
-    app: AppHandle,
-    db: Db,
-    scraper: Option<DiscordScraper>,
-    mut scrape_rx: mpsc::UnboundedReceiver<ScrapeRequest>,
+enum WorkItem {
+    Scrape(ScrapeRequest),
+    Watch(WatchRequest),
+    Unwatch(WatchRequest),
+    Poll(WatchedChannel),
+}
+
+async fn command_queue_loop(
+    mut command_rx: mpsc::UnboundedReceiver<DiscordCommand>,
+    work_tx: mpsc::UnboundedSender<WorkItem>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -129,16 +151,85 @@ async fn scrape_loop(
                 let _ = changed;
                 break;
             }
-            req = scrape_rx.recv() => {
-                let Some(req) = req else {
+            command = command_rx.recv() => {
+                let Some(command) = command else {
                     break;
                 };
-                let app = app.clone();
-                let db = db.clone();
-                let scraper = scraper.clone();
-                async_runtime::spawn(async move {
-                    do_scrape(app, db, scraper, req).await;
-                });
+                let item = match command {
+                    DiscordCommand::Scrape(req) => WorkItem::Scrape(req),
+                    DiscordCommand::Watch(req) => WorkItem::Watch(req),
+                    DiscordCommand::Unwatch(req) => WorkItem::Unwatch(req),
+                };
+                if work_tx.send(item).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn watch_scheduler_loop(
+    db: Db,
+    work_tx: mpsc::UnboundedSender<WorkItem>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut interval = interval_at(Instant::now() + WATCH_INTERVAL, WATCH_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                break;
+            }
+            _ = interval.tick() => {
+                let watched = match db.list_watched_channels() {
+                    Ok(watched) => watched,
+                    Err(e) => {
+                        tracing::warn!("failed to list watched channels: {e}");
+                        continue;
+                    }
+                };
+                for channel in watched {
+                    tracing::debug!(
+                        "queueing watch poll for {} watched by {} at {} last polled {:?}",
+                        channel.channel_id,
+                        channel.watched_by,
+                        channel.watched_at,
+                        channel.last_polled_at
+                    );
+                    if work_tx.send(WorkItem::Poll(channel)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn work_loop(
+    app: AppHandle,
+    db: Db,
+    scraper: Option<DiscordScraper>,
+    mut work_rx: mpsc::UnboundedReceiver<WorkItem>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                break;
+            }
+            item = work_rx.recv() => {
+                let Some(item) = item else {
+                    break;
+                };
+                match item {
+                    WorkItem::Scrape(req) => do_scrape(app.clone(), db.clone(), scraper.clone(), req).await,
+                    WorkItem::Watch(req) => do_watch(db.clone(), scraper.clone(), req).await,
+                    WorkItem::Unwatch(req) => do_unwatch(db.clone(), req).await,
+                    WorkItem::Poll(channel) => do_watch_poll(app.clone(), db.clone(), scraper.clone(), channel).await,
+                }
             }
         }
     }
@@ -203,98 +294,37 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
             ))
             .await;
 
-        let existing_actions = db
-            .list_source_actions("discord", &req.channel_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to load existing source actions: {e}");
-                Vec::new()
-            });
-        let existing_decisions = db
-            .list_source_decisions(&req.scrape_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to load existing source decisions: {e}");
-                Vec::new()
-            });
-
-        let extracted = ai::extract(
+        extract_and_store(
+            &app,
+            &db,
+            &current_user,
+            &req.scrape_id,
+            &req.channel_id,
             &messages,
-            &existing_actions,
-            &existing_decisions,
-            Some(&current_user),
         )
         .await
-        .context("Claude extraction failed")?;
-        Ok::<_, anyhow::Error>((messages, extracted))
+        .context("extraction failed")
     }
     .await;
 
     match result {
-        Ok((messages, extracted)) => {
-            let decisions: Vec<_> = extracted
-                .decisions
-                .into_iter()
-                .map(|d| DecisionCandidate {
-                    text: d.text,
-                    context: d.context,
-                    message_ids: d.message_ids.unwrap_or_default(),
-                    dedupe_key: d.dedupe_key,
-                    merge_with: d.merge_with,
-                })
-                .collect();
-            let mut action_items: Vec<_> = extracted
-                .action_items
-                .into_iter()
-                .map(|a| {
-                    let message_ids = a.message_ids.unwrap_or_default();
-                    let url = normalize_pr_url(a.url.as_deref())
-                        .or_else(|| find_pr_url_for_action(&messages, &message_ids));
-
-                    ActionCandidate {
-                        text: a.text,
-                        assignee: a.assignee,
-                        assignee_key: a.assignee_key,
-                        due: a.due,
-                        url,
-                        message_ids,
-                        dedupe_key: a.dedupe_key,
-                        merge_with: a.merge_with,
-                    }
-                })
-                .collect();
-            add_pr_notification_fallbacks(&mut action_items, &messages, Some(&current_user));
-
-            match db.mark_extracted(
-                &req.scrape_id,
-                messages.first().map(|message| message.id.as_str()),
-                messages.last().map(|message| message.id.as_str()),
-                messages.len() as i64,
-                &extracted.summary,
-                &decisions,
-                &action_items,
-            ) {
-                Ok(updated) => {
-                    let _ = app.emit("scrape:updated", &updated);
-                    if let Ok(actions) = db.list_open_action_items() {
-                        let _ = app.emit("actions:updated", &actions);
-                    }
-                    let _ = req
-                        .reply
-                        .send(format!(
-                            "Done: {} messages, {} decision{}, {} action item{}. Open Crumb to view.",
-                            messages.len(),
-                            decisions.len(),
-                            if decisions.len() == 1 { "" } else { "s" },
-                            action_items.len(),
-                            if action_items.len() == 1 { "" } else { "s" }
-                        ))
-                        .await;
-                }
-                Err(e) => {
-                    tracing::error!("mark_extracted: {e}");
-                    emit_failed(&app, &db, &req.scrape_id, &e.to_string());
-                    let _ = req.reply.send(format!("Scrape failed: {e}")).await;
-                }
-            }
+        Ok(outcome) => {
+            notify_new_actions(
+                &app,
+                outcome.new_action_count,
+                outcome.source_label.as_deref(),
+            );
+            let _ = req
+                .reply
+                .send(format!(
+                    "Done: {} messages, {} decision{}, {} action item{}. Open Crumb to view.",
+                    outcome.message_count,
+                    outcome.decision_count,
+                    if outcome.decision_count == 1 { "" } else { "s" },
+                    outcome.action_count,
+                    if outcome.action_count == 1 { "" } else { "s" }
+                ))
+                .await;
         }
         Err(e) => {
             let msg = e.to_string();
@@ -304,6 +334,257 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
             let _ = req.reply.send(format!("Scrape failed: {user_msg}")).await;
         }
     }
+}
+
+async fn do_watch(db: Db, scraper: Option<DiscordScraper>, req: WatchRequest) {
+    let Some(scraper) = scraper else {
+        let msg = "Watcher is offline. DISCORD_USER_TOKEN is missing or rejected. Re-extract it from the Discord web app and restart Crumb.";
+        let _ = req.reply.send(msg).await;
+        return;
+    };
+
+    let result = async {
+        let latest = scraper
+            .fetch_channel_messages(&req.channel_id, 1, |_| {})
+            .await
+            .context("fetching latest message for watch cursor")?;
+        let cursor = latest
+            .last()
+            .map(|message| message.id.as_str())
+            .unwrap_or(req.interaction_id.as_str());
+        db.watch_channel(
+            &req.channel_id,
+            req.channel_name.as_deref(),
+            req.guild_id.as_deref(),
+            req.guild_name.as_deref(),
+            &req.triggered_by,
+            Some(cursor),
+        )?;
+        Ok::<_, anyhow::Error>(cursor.to_string())
+    }
+    .await;
+
+    match result {
+        Ok(_) => {
+            let label = channel_label(
+                req.guild_name.as_deref(),
+                req.channel_name.as_deref(),
+                &req.channel_id,
+            );
+            let _ = req
+                .reply
+                .send(format!(
+                    "Watching {label}. I'll only process messages posted after now."
+                ))
+                .await;
+        }
+        Err(e) => {
+            tracing::error!("watch failed: {e}");
+            let _ = req.reply.send(format!("Watch failed: {e}")).await;
+        }
+    }
+}
+
+async fn do_unwatch(db: Db, req: WatchRequest) {
+    match db.unwatch_channel(&req.channel_id) {
+        Ok(true) => {
+            let label = channel_label(
+                req.guild_name.as_deref(),
+                req.channel_name.as_deref(),
+                &req.channel_id,
+            );
+            let _ = req.reply.send(format!("Stopped watching {label}.")).await;
+        }
+        Ok(false) => {
+            let _ = req.reply.send("This channel was not being watched.").await;
+        }
+        Err(e) => {
+            tracing::error!("unwatch failed: {e}");
+            let _ = req.reply.send(format!("Unwatch failed: {e}")).await;
+        }
+    }
+}
+
+async fn do_watch_poll(
+    app: AppHandle,
+    db: Db,
+    scraper: Option<DiscordScraper>,
+    channel: WatchedChannel,
+) {
+    let Some(scraper) = scraper else {
+        tracing::warn!("skipping watch poll; scraper is offline");
+        return;
+    };
+    let current_user = scraper.self_user();
+    let scrape_id = format!("{}:{}", channel.source, channel.channel_id);
+
+    let result = async {
+        let Some(cursor) = channel.last_seen_message_id.as_deref() else {
+            let latest = scraper
+                .fetch_channel_messages(&channel.channel_id, 1, |_| {})
+                .await
+                .context("fetching latest watched channel cursor")?;
+            db.update_watch_cursor(
+                &channel.channel_id,
+                latest.last().map(|message| message.id.as_str()),
+            )?;
+            return Ok::<_, anyhow::Error>(None);
+        };
+        let fetched = scraper
+            .fetch_channel_messages_after(&channel.channel_id, cursor, WATCH_FETCH_LIMIT, |_| {})
+            .await
+            .context("fetching watched channel messages after cursor")?;
+        let messages = filter_messages_after_cursor(fetched, cursor);
+
+        if messages.is_empty() {
+            db.update_watch_cursor(&channel.channel_id, None)?;
+            return Ok(None);
+        }
+
+        let summary = db.insert_running(
+            &scrape_id,
+            &channel.channel_id,
+            channel.channel_name.as_deref(),
+            channel.guild_id.as_deref(),
+            channel.guild_name.as_deref(),
+            "watcher",
+        )?;
+        let _ = app.emit("scrape:new", &summary);
+
+        let outcome = extract_and_store(
+            &app,
+            &db,
+            &current_user,
+            &scrape_id,
+            &channel.channel_id,
+            &messages,
+        )
+        .await?;
+        db.update_watch_cursor(
+            &channel.channel_id,
+            messages.last().map(|message| message.id.as_str()),
+        )?;
+        Ok(Some(outcome))
+    }
+    .await;
+
+    match result {
+        Ok(Some(outcome)) => {
+            notify_new_actions(
+                &app,
+                outcome.new_action_count,
+                outcome.source_label.as_deref(),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("watch poll failed for {}: {e}", channel.channel_id);
+            emit_failed(&app, &db, &scrape_id, &e.to_string());
+        }
+    }
+}
+
+struct ExtractionOutcome {
+    message_count: usize,
+    decision_count: usize,
+    action_count: usize,
+    new_action_count: usize,
+    source_label: Option<String>,
+}
+
+async fn extract_and_store(
+    app: &AppHandle,
+    db: &Db,
+    current_user: &NormalizedPerson,
+    scrape_id: &str,
+    channel_id: &str,
+    messages: &[NormalizedMessage],
+) -> Result<ExtractionOutcome> {
+    let existing_actions = db.list_source_actions("discord", channel_id)?;
+    let existing_action_ids = existing_actions
+        .iter()
+        .map(|action| action.id.clone())
+        .collect::<HashSet<_>>();
+    let existing_action_statuses = existing_actions
+        .iter()
+        .map(|action| (action.id.clone(), action.status.clone()))
+        .collect::<HashMap<_, _>>();
+    let existing_decisions = db.list_source_decisions(scrape_id)?;
+
+    let extracted = ai::extract(
+        messages,
+        &existing_actions,
+        &existing_decisions,
+        Some(current_user),
+    )
+    .await?;
+
+    let decisions: Vec<_> = extracted
+        .decisions
+        .into_iter()
+        .map(|d| DecisionCandidate {
+            text: d.text,
+            context: d.context,
+            message_ids: d.message_ids.unwrap_or_default(),
+            dedupe_key: d.dedupe_key,
+            merge_with: d.merge_with,
+        })
+        .collect();
+    let mut action_items: Vec<_> = extracted
+        .action_items
+        .into_iter()
+        .map(|a| {
+            let message_ids = a.message_ids.unwrap_or_default();
+            let url = normalize_pr_url(a.url.as_deref())
+                .or_else(|| find_pr_url_for_action(messages, &message_ids));
+
+            ActionCandidate {
+                text: a.text,
+                assignee: a.assignee,
+                assignee_key: a.assignee_key,
+                due: a.due,
+                url,
+                message_ids,
+                dedupe_key: a.dedupe_key,
+                merge_with: a.merge_with,
+            }
+        })
+        .collect();
+    add_pr_notification_fallbacks(&mut action_items, messages, Some(current_user));
+
+    let updated = db.mark_extracted(
+        scrape_id,
+        messages.first().map(|message| message.id.as_str()),
+        messages.last().map(|message| message.id.as_str()),
+        messages.len() as i64,
+        &extracted.summary,
+        &decisions,
+        &action_items,
+    )?;
+    let after_actions = db.list_source_actions("discord", channel_id)?;
+    let new_action_count = after_actions
+        .iter()
+        .filter(|action| {
+            !existing_action_ids.contains(&action.id)
+                || existing_action_statuses
+                    .get(&action.id)
+                    .is_some_and(|status| matches!(status.as_str(), "done" | "archived"))
+                    && matches!(action.status.as_str(), "inbox" | "active")
+        })
+        .count();
+
+    let _ = app.emit("scrape:updated", &updated);
+    if let Ok(actions) = db.list_open_action_items() {
+        let _ = app.emit("actions:updated", &actions);
+    }
+
+    Ok(ExtractionOutcome {
+        message_count: messages.len(),
+        decision_count: decisions.len(),
+        action_count: action_items.len(),
+        new_action_count,
+        source_label: Some(source_label_from_summary(&updated)),
+    })
 }
 
 fn is_outside_scraped_range(
@@ -322,11 +603,58 @@ fn is_outside_scraped_range(
     }
 }
 
+fn filter_messages_after_cursor(
+    messages: Vec<NormalizedMessage>,
+    cursor: &str,
+) -> Vec<NormalizedMessage> {
+    messages
+        .into_iter()
+        .filter(|message| compare_snowflake_ids(&message.id, cursor).is_gt())
+        .collect()
+}
+
 fn compare_snowflake_ids(a: &str, b: &str) -> std::cmp::Ordering {
     let parsed = a.parse::<u128>().ok().zip(b.parse::<u128>().ok());
     match parsed {
         Some((a, b)) => a.cmp(&b),
         None => a.cmp(b),
+    }
+}
+
+fn channel_label(guild_name: Option<&str>, channel_name: Option<&str>, channel_id: &str) -> String {
+    match (guild_name, channel_name) {
+        (Some(guild), Some(channel)) => format!("{guild} / {channel}"),
+        (None, Some(channel)) => channel.to_string(),
+        (Some(guild), None) => format!("{guild} / {channel_id}"),
+        (None, None) => channel_id.to_string(),
+    }
+}
+
+fn source_label_from_summary(summary: &ScrapeSummary) -> String {
+    channel_label(
+        summary.guild_name.as_deref(),
+        summary.channel_name.as_deref(),
+        &summary.channel_id,
+    )
+}
+
+fn notify_new_actions(app: &AppHandle, count: usize, source_label: Option<&str>) {
+    if count == 0 {
+        return;
+    }
+    let source = source_label.unwrap_or("watched source");
+    let body = format!(
+        "{count} new action item{} from {source}",
+        if count == 1 { "" } else { "s" }
+    );
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("Crumb")
+        .body(body)
+        .show()
+    {
+        tracing::warn!("failed to send notification: {e}");
     }
 }
 
@@ -654,6 +982,25 @@ mod tests {
             Some("discord:user:current")
         );
         assert_eq!(actions[0].assignee.as_deref(), Some("Current User"));
+    }
+
+    #[test]
+    fn watch_filter_only_keeps_messages_after_cursor() {
+        let messages = vec![
+            message("99", "old"),
+            message("100", "cursor"),
+            message("101", "new"),
+        ];
+
+        let filtered = filter_messages_after_cursor(messages, "100");
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["101"]
+        );
     }
 
     fn message(id: &str, content: &str) -> NormalizedMessage {

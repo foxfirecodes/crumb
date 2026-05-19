@@ -52,6 +52,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0006_action_urls.sql"),
         prepare: Some(prepare_action_urls_migration),
     },
+    Migration {
+        id: "0007_watched_channels",
+        sql: include_str!("../migrations/0007_watched_channels.sql"),
+        prepare: Some(prepare_watched_channels_migration),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -79,6 +84,19 @@ pub struct ActionCandidate {
 pub struct ScrapeMessageRange {
     pub first_message_id: Option<String>,
     pub last_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchedChannel {
+    pub source: String,
+    pub channel_id: String,
+    pub channel_name: Option<String>,
+    pub guild_id: Option<String>,
+    pub guild_name: Option<String>,
+    pub watched_by: String,
+    pub watched_at: i64,
+    pub last_seen_message_id: Option<String>,
+    pub last_polled_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -230,6 +248,117 @@ impl Db {
         Ok(range)
     }
 
+    pub fn watch_channel(
+        &self,
+        channel_id: &str,
+        channel_name: Option<&str>,
+        guild_id: Option<&str>,
+        guild_name: Option<&str>,
+        watched_by: &str,
+        last_seen_message_id: Option<&str>,
+    ) -> Result<WatchedChannel> {
+        let now = Utc::now().timestamp_millis();
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO watched_channels (
+               source, channel_id, channel_name, guild_id, guild_name,
+               watched_by, watched_at, last_seen_message_id, last_polled_at
+             )
+             VALUES ('discord', ?, ?, ?, ?, ?, ?, ?, NULL)
+             ON CONFLICT(source, channel_id) DO UPDATE SET
+               channel_name = excluded.channel_name,
+               guild_id = excluded.guild_id,
+               guild_name = excluded.guild_name,
+               watched_by = excluded.watched_by,
+               watched_at = excluded.watched_at,
+               last_seen_message_id = excluded.last_seen_message_id,
+               last_polled_at = NULL",
+            rusqlite::params![
+                channel_id,
+                channel_name,
+                guild_id,
+                guild_name,
+                watched_by,
+                now,
+                last_seen_message_id
+            ],
+        )?;
+        drop(conn);
+        self.get_watched_channel("discord", channel_id)?
+            .context("watched channel vanished after insert")
+    }
+
+    pub fn unwatch_channel(&self, channel_id: &str) -> Result<bool> {
+        let conn = self.inner.lock();
+        let changed = conn.execute(
+            "DELETE FROM watched_channels WHERE source = 'discord' AND channel_id = ?",
+            [channel_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn list_watched_channels(&self) -> Result<Vec<WatchedChannel>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT source, channel_id, channel_name, guild_id, guild_name,
+                    watched_by, watched_at, last_seen_message_id, last_polled_at
+             FROM watched_channels
+             ORDER BY watched_at",
+        )?;
+        let result = stmt
+            .query_map([], row_to_watched_channel)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+
+    fn get_watched_channel(
+        &self,
+        source: &str,
+        channel_id: &str,
+    ) -> Result<Option<WatchedChannel>> {
+        let conn = self.inner.lock();
+        let watched = conn
+            .query_row(
+                "SELECT source, channel_id, channel_name, guild_id, guild_name,
+                        watched_by, watched_at, last_seen_message_id, last_polled_at
+                 FROM watched_channels
+                 WHERE source = ? AND channel_id = ?",
+                rusqlite::params![source, channel_id],
+                row_to_watched_channel,
+            )
+            .optional()?;
+        Ok(watched)
+    }
+
+    pub fn update_watch_cursor(
+        &self,
+        channel_id: &str,
+        last_seen_message_id: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let conn = self.inner.lock();
+        conn.execute(
+            "UPDATE watched_channels
+             SET last_polled_at = ?,
+                 last_seen_message_id = CASE
+                   WHEN ? IS NULL THEN last_seen_message_id
+                   WHEN last_seen_message_id IS NULL THEN ?
+                   WHEN CAST(? AS INTEGER) > CAST(last_seen_message_id AS INTEGER) THEN ?
+                   ELSE last_seen_message_id
+                 END
+             WHERE source = 'discord' AND channel_id = ?",
+            rusqlite::params![
+                now,
+                last_seen_message_id,
+                last_seen_message_id,
+                last_seen_message_id,
+                last_seen_message_id,
+                channel_id
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn get_scrape(&self, id: &str) -> Result<Option<ScrapeDetail>> {
         let conn = self.inner.lock();
         let summary: Option<ScrapeSummary> = conn
@@ -301,6 +430,11 @@ impl Db {
         )?;
         tx.execute(
             "DELETE FROM scrapes
+             WHERE source = ? AND channel_id = ?",
+            rusqlite::params![source_kind, source_scope],
+        )?;
+        tx.execute(
+            "DELETE FROM watched_channels
              WHERE source = ? AND channel_id = ?",
             rusqlite::params![source_kind, source_scope],
         )?;
@@ -663,6 +797,24 @@ fn prepare_action_urls_migration(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+fn prepare_watched_channels_migration(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS watched_channels (
+           source               TEXT NOT NULL CHECK(source IN ('discord')),
+           channel_id           TEXT NOT NULL,
+           channel_name         TEXT,
+           guild_id             TEXT,
+           guild_name           TEXT,
+           watched_by           TEXT NOT NULL,
+           watched_at           INTEGER NOT NULL,
+           last_seen_message_id TEXT,
+           last_polled_at       INTEGER,
+           PRIMARY KEY(source, channel_id)
+         );",
+    )?;
+    Ok(())
+}
+
 fn backfill_assignee_keys(conn: &rusqlite::Connection, table: &str) -> Result<()> {
     let rows = {
         let mut stmt = conn.prepare(&format!(
@@ -764,6 +916,20 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScrapeSummary> {
         message_count: row.get(9)?,
         summary: row.get(10)?,
         error: row.get(11)?,
+    })
+}
+
+fn row_to_watched_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchedChannel> {
+    Ok(WatchedChannel {
+        source: row.get(0)?,
+        channel_id: row.get(1)?,
+        channel_name: row.get(2)?,
+        guild_id: row.get(3)?,
+        guild_name: row.get(4)?,
+        watched_by: row.get(5)?,
+        watched_at: row.get(6)?,
+        last_seen_message_id: row.get(7)?,
+        last_polled_at: row.get(8)?,
     })
 }
 
@@ -908,6 +1074,21 @@ fn upsert_canonical_action(
            last_seen_at = excluded.last_seen_at,
            source_label = excluded.source_label,
            latest_context = excluded.latest_context,
+           status = CASE
+             WHEN canonical_action_items.status IN ('done', 'archived')
+             THEN 'inbox'
+             ELSE canonical_action_items.status
+           END,
+           completed_at = CASE
+             WHEN canonical_action_items.status IN ('done', 'archived')
+             THEN NULL
+             ELSE canonical_action_items.completed_at
+           END,
+           snoozed_until = CASE
+             WHEN canonical_action_items.status IN ('done', 'archived')
+             THEN NULL
+             ELSE canonical_action_items.snoozed_until
+           END,
            assignee_key = COALESCE(canonical_action_items.assignee_key, excluded.assignee_key),
            assignee = COALESCE(canonical_action_items.assignee, excluded.assignee),
            due = COALESCE(canonical_action_items.due, excluded.due),
@@ -972,6 +1153,21 @@ fn update_canonical_action(
          SET last_seen_at = ?,
              source_label = ?,
              latest_context = ?,
+             status = CASE
+               WHEN status IN ('done', 'archived')
+               THEN 'inbox'
+               ELSE status
+             END,
+             completed_at = CASE
+               WHEN status IN ('done', 'archived')
+               THEN NULL
+               ELSE completed_at
+             END,
+             snoozed_until = CASE
+               WHEN status IN ('done', 'archived')
+               THEN NULL
+               ELSE snoozed_until
+             END,
              assignee_key = COALESCE(canonical_action_items.assignee_key, ?),
              assignee = COALESCE(canonical_action_items.assignee, ?),
              due = COALESCE(canonical_action_items.due, ?),
@@ -1471,7 +1667,8 @@ mod tests {
                 "0003_assignee_keys",
                 "0004_scrape_cursor",
                 "0005_scrape_range",
-                "0006_action_urls"
+                "0006_action_urls",
+                "0007_watched_channels"
             ]
         );
 
@@ -1554,7 +1751,8 @@ mod tests {
                 "0003_assignee_keys",
                 "0004_scrape_cursor",
                 "0005_scrape_range",
-                "0006_action_urls"
+                "0006_action_urls",
+                "0007_watched_channels"
             ]
         );
 
@@ -1676,6 +1874,71 @@ mod tests {
     }
 
     #[test]
+    fn re_seen_dismissed_actions_return_to_inbox() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-action-reseen-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("Nelly (DM)"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("100"),
+            Some("100"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Merge approved PR #123".into(),
+                assignee_key: Some("discord:user:fox".into()),
+                assignee: Some("fox".into()),
+                due: None,
+                url: Some("https://github.com/example/repo/pull/123".into()),
+                message_ids: vec!["100".into()],
+                dedupe_key: Some("merge-approved-pr-github-com-example-repo-pull-123".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let action_id = db.list_open_action_items()?[0].id.clone();
+        db.set_action_status(&action_id, "done")?;
+        assert!(db.list_open_action_items()?.is_empty());
+
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("101"),
+            Some("101"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Merge approved PR #123".into(),
+                assignee_key: Some("discord:user:fox".into()),
+                assignee: Some("fox".into()),
+                due: None,
+                url: Some("https://github.com/example/repo/pull/123".into()),
+                message_ids: vec!["101".into()],
+                dedupe_key: Some("merge-approved-pr-github-com-example-repo-pull-123".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let actions = db.list_open_action_items()?;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].id, action_id);
+        assert_eq!(actions[0].status, "inbox");
+        assert_eq!(actions[0].completed_at, None);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
     fn action_assignee_can_be_updated() -> Result<()> {
         let db_path =
             std::env::temp_dir().join(format!("crumb-action-assignee-{}.db", uuid::Uuid::new_v4()));
@@ -1759,6 +2022,36 @@ mod tests {
         let range = db.scraped_message_range("discord:channel-1")?;
         assert_eq!(range.first_message_id.as_deref(), Some("50"));
         assert_eq!(range.last_message_id.as_deref(), Some("250"));
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn watched_channels_can_be_persisted_and_unwatched() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-watch-channel-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+
+        db.watch_channel(
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+            Some("100"),
+        )?;
+        let watched = db.list_watched_channels()?;
+        assert_eq!(watched.len(), 1);
+        assert_eq!(watched[0].channel_id, "channel-1");
+        assert_eq!(watched[0].last_seen_message_id.as_deref(), Some("100"));
+
+        db.update_watch_cursor("channel-1", Some("150"))?;
+        let watched = db.list_watched_channels()?;
+        assert_eq!(watched[0].last_seen_message_id.as_deref(), Some("150"));
+
+        assert!(db.unwatch_channel("channel-1")?);
+        assert!(db.list_watched_channels()?.is_empty());
 
         let _ = std::fs::remove_file(db_path);
         Ok(())

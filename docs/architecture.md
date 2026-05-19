@@ -33,6 +33,15 @@ SQLite database in app data dir
 5. `db.rs::mark_extracted` stores source-local decisions/action candidates, upserts canonical action items, attaches evidence, dedupes similar canonical actions, updates the scraped message range, and emits UI updates.
 6. React refreshes Actions/Sources through Tauri commands and events.
 
+## Watching Flow
+
+1. User runs `/watch` or `/unwatch` in Discord.
+2. `discord.rs` enqueues the command. `/watch` seeds `watched_channels.last_seen_message_id` from the newest message at that moment, so the first poll does not backfill older messages.
+3. `runtime.rs` has a five-minute scheduler that enqueues one poll task per watched channel.
+4. A single worker consumes scrape/watch/poll tasks sequentially to reduce Discord API pressure.
+5. Watch polls fetch at most the latest 100 messages and process only messages whose snowflake is newer than the watch cursor.
+6. Successful extraction updates the watch cursor and sends a system notification when new canonical action items were created.
+
 ## Data Model Notes
 
 - `action_items` are source-local extracted rows for a scrape/source detail.
@@ -41,6 +50,7 @@ SQLite database in app data dir
 - `source_kind` is currently mostly `discord`.
 - `source_scope` for Discord is the channel ID.
 - Source rows are keyed like `discord:{channel_id}` for the current Discord channel MVP.
+- `watched_channels` stores persistent Discord watch state and its new-message cursor.
 - `status` values are `inbox | active | snoozed | done | archived`.
 - The main Actions view lists `inbox` and `active`; dismissed view lists `done` and `archived`.
 - `assignee` is display text. `assignee_key` is the stable filter key.

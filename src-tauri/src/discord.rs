@@ -49,6 +49,24 @@ pub struct ScrapeRequest {
 }
 
 #[derive(Debug)]
+pub struct WatchRequest {
+    pub interaction_id: String,
+    pub channel_id: String,
+    pub channel_name: Option<String>,
+    pub guild_id: Option<String>,
+    pub guild_name: Option<String>,
+    pub triggered_by: String,
+    pub reply: InteractionReply,
+}
+
+#[derive(Debug)]
+pub enum DiscordCommand {
+    Scrape(ScrapeRequest),
+    Watch(WatchRequest),
+    Unwatch(WatchRequest),
+}
+
+#[derive(Debug)]
 pub struct BotReady {
     pub bot_user: Option<String>,
 }
@@ -88,6 +106,20 @@ impl DiscordBot {
                 ],
                 "integration_types": [1, 0],
                 "contexts": [0, 1, 2]
+            },
+            {
+                "type": 1,
+                "name": "watch",
+                "description": "Watch this channel for new action items every few minutes.",
+                "integration_types": [1, 0],
+                "contexts": [0, 1, 2]
+            },
+            {
+                "type": 1,
+                "name": "unwatch",
+                "description": "Stop watching this channel for new action items.",
+                "integration_types": [1, 0],
+                "contexts": [0, 1, 2]
             }
         ]);
 
@@ -104,13 +136,13 @@ impl DiscordBot {
         expect_success(response)
             .await
             .context("Discord command registration failed")?;
-        tracing::info!("registered /scrape command");
+        tracing::info!("registered Discord commands");
         Ok(())
     }
 
     pub async fn run(
         self,
-        scrape_tx: mpsc::UnboundedSender<ScrapeRequest>,
+        command_tx: mpsc::UnboundedSender<DiscordCommand>,
         shutdown: watch::Receiver<bool>,
         ready_tx: oneshot::Sender<BotReady>,
     ) {
@@ -123,7 +155,7 @@ impl DiscordBot {
             }
 
             let result = self
-                .run_gateway_once(scrape_tx.clone(), &mut shutdown, &mut ready_tx)
+                .run_gateway_once(command_tx.clone(), &mut shutdown, &mut ready_tx)
                 .await;
 
             if *shutdown.borrow() {
@@ -143,7 +175,7 @@ impl DiscordBot {
 
     async fn run_gateway_once(
         &self,
-        scrape_tx: mpsc::UnboundedSender<ScrapeRequest>,
+        command_tx: mpsc::UnboundedSender<DiscordCommand>,
         shutdown: &mut watch::Receiver<bool>,
         ready_tx: &mut Option<oneshot::Sender<BotReady>>,
     ) -> Result<()> {
@@ -186,7 +218,7 @@ impl DiscordBot {
                             }
                             match payload.op {
                                 0 => {
-                                    self.handle_dispatch(payload, &scrape_tx, ready_tx).await?;
+                                    self.handle_dispatch(payload, &command_tx, ready_tx).await?;
                                 }
                                 1 => {
                                     write
@@ -241,7 +273,7 @@ impl DiscordBot {
     async fn handle_dispatch(
         &self,
         payload: GatewayPayload,
-        scrape_tx: &mpsc::UnboundedSender<ScrapeRequest>,
+        command_tx: &mpsc::UnboundedSender<DiscordCommand>,
         ready_tx: &mut Option<oneshot::Sender<BotReady>>,
     ) -> Result<()> {
         match payload.t.as_deref() {
@@ -257,22 +289,18 @@ impl DiscordBot {
             Some("INTERACTION_CREATE") => {
                 let interaction: InteractionCreate =
                     serde_json::from_value(payload.d).context("parsing INTERACTION_CREATE")?;
-                if interaction.kind != 2 || interaction.data.name != "scrape" {
+                if interaction.kind != 2
+                    || !matches!(
+                        interaction.data.name.as_str(),
+                        "scrape" | "watch" | "unwatch"
+                    )
+                {
                     return Ok(());
                 }
 
                 if let Err(e) = self.defer_reply(&interaction).await {
                     tracing::warn!("failed to defer /scrape reply: {e}");
                 }
-
-                let limit = interaction
-                    .data
-                    .options
-                    .iter()
-                    .find(|opt| opt.name == "limit")
-                    .and_then(|opt| opt.value.as_i64())
-                    .unwrap_or(200)
-                    .clamp(1, 1000) as usize;
 
                 let user = interaction
                     .user
@@ -295,23 +323,58 @@ impl DiscordBot {
                             None
                         }),
                 };
-                let req = ScrapeRequest {
-                    scrape_id: format!("discord:{channel_id}"),
-                    channel_id,
-                    channel_name,
-                    guild_id: interaction.guild_id,
-                    guild_name: interaction.guild.and_then(|g| g.name),
-                    triggered_by: user,
-                    limit,
-                    reply: InteractionReply {
-                        http: self.http.clone(),
-                        app_id: self.app_id.clone(),
-                        interaction_token: interaction.token,
-                    },
+                let guild_id = interaction.guild_id;
+                let guild_name = interaction.guild.and_then(|g| g.name);
+                let reply = InteractionReply {
+                    http: self.http.clone(),
+                    app_id: self.app_id.clone(),
+                    interaction_token: interaction.token,
                 };
 
-                scrape_tx
-                    .send(req)
+                let command = match interaction.data.name.as_str() {
+                    "scrape" => {
+                        let limit = interaction
+                            .data
+                            .options
+                            .iter()
+                            .find(|opt| opt.name == "limit")
+                            .and_then(|opt| opt.value.as_i64())
+                            .unwrap_or(200)
+                            .clamp(1, 1000) as usize;
+                        DiscordCommand::Scrape(ScrapeRequest {
+                            scrape_id: format!("discord:{channel_id}"),
+                            channel_id,
+                            channel_name,
+                            guild_id,
+                            guild_name,
+                            triggered_by: user,
+                            limit,
+                            reply,
+                        })
+                    }
+                    "watch" => DiscordCommand::Watch(WatchRequest {
+                        interaction_id: interaction.id,
+                        channel_id,
+                        channel_name,
+                        guild_id,
+                        guild_name,
+                        triggered_by: user,
+                        reply,
+                    }),
+                    "unwatch" => DiscordCommand::Unwatch(WatchRequest {
+                        interaction_id: interaction.id,
+                        channel_id,
+                        channel_name,
+                        guild_id,
+                        guild_name,
+                        triggered_by: user,
+                        reply,
+                    }),
+                    _ => return Ok(()),
+                };
+
+                command_tx
+                    .send(command)
                     .map_err(|_| anyhow!("scrape runtime is not accepting requests"))?;
             }
             _ => {}
@@ -489,6 +552,55 @@ impl DiscordScraper {
         }
 
         messages.reverse();
+        Ok(messages)
+    }
+
+    pub async fn fetch_channel_messages_after<F>(
+        &self,
+        channel_id: &str,
+        after_message_id: &str,
+        limit: usize,
+        mut on_progress: F,
+    ) -> Result<Vec<NormalizedMessage>>
+    where
+        F: FnMut(usize),
+    {
+        let query = vec![
+            ("limit".to_string(), limit.clamp(1, 100).to_string()),
+            ("after".into(), after_message_id.to_string()),
+        ];
+        let url = format!("{DISCORD_API}/channels/{channel_id}/messages");
+        let mut attempts = 0;
+        let batch: Vec<ApiMessage> = loop {
+            attempts += 1;
+            let response = self
+                .http
+                .get(&url)
+                .header(AUTHORIZATION, self.token.as_str())
+                .header(USER_AGENT, USER_AGENT_VALUE)
+                .query(&query)
+                .send()
+                .await
+                .context("fetching Discord messages after cursor")?;
+
+            if response.status().as_u16() == 429 {
+                let retry: RateLimit = response
+                    .json()
+                    .await
+                    .context("parsing Discord rate limit")?;
+                if attempts >= 3 {
+                    bail!("Discord rate limited request; retry the scrape in a moment");
+                }
+                sleep(Duration::from_secs_f64(retry.retry_after.max(0.25))).await;
+                continue;
+            }
+
+            break parse_json_response(response).await?;
+        };
+
+        let mut messages = batch.into_iter().map(Into::into).collect::<Vec<_>>();
+        messages.sort_by(|a: &NormalizedMessage, b| compare_message_ids(&a.id, &b.id));
+        on_progress(messages.len());
         Ok(messages)
     }
 }
@@ -752,6 +864,14 @@ fn clean_summary(value: String) -> Option<String> {
         ))
     } else {
         Some(cleaned)
+    }
+}
+
+fn compare_message_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    let parsed = a.parse::<u128>().ok().zip(b.parse::<u128>().ok());
+    match parsed {
+        Some((a, b)) => a.cmp(&b),
+        None => a.cmp(b),
     }
 }
 

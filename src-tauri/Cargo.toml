@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A personal AI assistant that follows breadcrumbs across your work tools."
 authors = ["foxfirecodes"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.77.2"
 
 [lib]
 name = "crumb_lib"
@@ -32,6 +32,7 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
 
 [features]
 default = ["custom-protocol"]
