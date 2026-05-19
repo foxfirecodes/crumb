@@ -6,16 +6,18 @@ use agent_client_protocol::schema::{
 };
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::discord::NormalizedMessage;
+use crate::events::{CanonicalActionItem, Decision};
 
-const DEFAULT_ACP_AGENT_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.33.1";
+const DEFAULT_ACP_AGENT_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.33.1";
 
-const SYSTEM_PROMPT: &str = r#"You are an extraction specialist. You receive a chronological transcript of Discord messages from a single channel. Your job is to identify:
+const SYSTEM_PROMPT: &str = r#"You are an extraction and reconciliation specialist. You receive a chronological transcript of Discord messages from a single source plus existing records Crumb already knows about from that source. Your job is to identify:
 
 1. DECISIONS: concrete choices made during the conversation. A decision is something the group settled on, not a question or proposal.
 2. ACTION ITEMS: concrete things someone committed to do, with assignee and due date if mentioned.
@@ -23,7 +25,13 @@ const SYSTEM_PROMPT: &str = r#"You are an extraction specialist. You receive a c
 
 Rules:
 - Be conservative. Only surface things that are clearly decisions or commitments, not idle discussion.
-- Quote the original wording in "context"; do not paraphrase decisions.
+- Reconcile aggressively. If a newly extracted action item is the same real-world task as an existing action item, set "merge_with" to the existing action item's id.
+- Treat wording variations as duplicates when the owner, object, and outcome are substantially the same. Example: "provide partner user IDs for whitelisting" and "send Lew partner user IDs to add to the experiment" are the same task.
+- Deduplicate within this response too. Return one action item per real-world task and one decision per real-world decision.
+- For action item "text", produce a concise canonical title. If "merge_with" is set, prefer the existing title unless the new wording is clearly better.
+- For decisions, quote the original wording in "context"; do not paraphrase the evidence.
+- "dedupe_key" must be stable across repeated scrapes. Use a short lowercase semantic key, not a hash and not a sentence copy.
+- For repeated evidence from the same Discord messages, reuse the same "message_ids".
 - "message_ids" should list the IDs of the messages that establish each item.
 - If there are no decisions or action items, return empty arrays. Do not invent items.
 - Do not use tools, inspect files, run commands, browse, or ask follow-up questions.
@@ -31,10 +39,10 @@ Rules:
 {
   "summary": "string",
   "decisions": [
-    { "text": "string", "context": "string", "message_ids": ["string"] }
+    { "text": "string", "context": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
   ],
   "action_items": [
-    { "text": "string", "assignee": "string", "due": "string", "message_ids": ["string"] }
+    { "text": "string", "assignee": "string", "due": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
   ]
 }"#;
 
@@ -45,6 +53,10 @@ pub struct ExtractedDecision {
     pub context: Option<String>,
     #[serde(default)]
     pub message_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default)]
+    pub merge_with: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +68,10 @@ pub struct ExtractedActionItem {
     pub due: Option<String>,
     #[serde(default)]
     pub message_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default)]
+    pub merge_with: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,7 +90,11 @@ pub struct ExtractionResult {
     pub action_items: Vec<ExtractedActionItem>,
 }
 
-pub async fn extract(messages: &[NormalizedMessage]) -> Result<ExtractionResult> {
+pub async fn extract(
+    messages: &[NormalizedMessage],
+    existing_actions: &[CanonicalActionItem],
+    existing_decisions: &[Decision],
+) -> Result<ExtractionResult> {
     if messages.is_empty() {
         return Ok(ExtractionResult {
             summary: "No messages found.".into(),
@@ -83,14 +103,13 @@ pub async fn extract(messages: &[NormalizedMessage]) -> Result<ExtractionResult>
         });
     }
 
-    let agent = match std::env::var("CRUMB_ACP_AGENT_COMMAND") {
-        Ok(command) => acp::AcpAgent::from_str(&command)
-            .with_context(|| format!("parsing CRUMB_ACP_AGENT_COMMAND: {command}"))?,
-        Err(_) => acp::AcpAgent::from_str(DEFAULT_ACP_AGENT_COMMAND)
-            .expect("valid pinned Claude Code ACP command"),
-    };
+    let agent = build_acp_agent()?;
 
-    let response = run_acp_prompt(agent, build_prompt(messages)).await?;
+    let response = run_acp_prompt(
+        agent,
+        build_prompt(messages, existing_actions, existing_decisions)?,
+    )
+    .await?;
     let json = extract_json_object(&response).with_context(|| {
         format!("Claude ACP response did not contain a JSON object: {response}")
     })?;
@@ -141,7 +160,9 @@ async fn run_acp_prompt(agent: acp::AcpAgent, prompt: String) -> Result<String> 
                     .await?;
 
                 let session = connection
-                    .send_request(NewSessionRequest::new(agent_workspace()))
+                    .send_request(
+                        NewSessionRequest::new(agent_workspace()).meta(acp_session_meta()),
+                    )
                     .block_task()
                     .await?;
 
@@ -170,11 +191,239 @@ fn agent_workspace() -> PathBuf {
     std::env::temp_dir()
 }
 
-fn build_prompt(messages: &[NormalizedMessage]) -> String {
-    format!(
-        "{SYSTEM_PROMPT}\n\nAnalyze this Discord channel transcript and extract decisions, action items, and a summary.\n\n<transcript>\n{}\n</transcript>",
+fn build_acp_agent() -> Result<acp::AcpAgent> {
+    if let Ok(command) = std::env::var("CRUMB_ACP_AGENT_COMMAND") {
+        if command.trim_start().starts_with('{') {
+            return acp::AcpAgent::from_str(&command)
+                .with_context(|| format!("parsing CRUMB_ACP_AGENT_COMMAND: {command}"));
+        }
+
+        let command = format!("{} {command}", acp_agent_env_prefix())
+            .trim()
+            .to_string();
+        return acp::AcpAgent::from_str(&command)
+            .with_context(|| format!("parsing CRUMB_ACP_AGENT_COMMAND: {command}"));
+    }
+
+    let mut args = acp_agent_env_args();
+    args.extend(["npx".into(), "-y".into(), DEFAULT_ACP_AGENT_PACKAGE.into()]);
+    acp::AcpAgent::from_args(args).context("building pinned Claude ACP command")
+}
+
+fn acp_agent_env_args() -> Vec<String> {
+    let model = crumb_ai_model();
+    let effort = crumb_ai_effort();
+    let mut env = vec![
+        format!("ANTHROPIC_MODEL={model}"),
+        format!("CLAUDE_CODE_EFFORT_LEVEL={effort}"),
+        format!("CLAUDE_CODE_SUBAGENT_MODEL={model}"),
+        "CLAUDE_CODE_DISABLE_CLAUDE_MDS=1".into(),
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1".into(),
+        "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1".into(),
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1".into(),
+        "CLAUDE_CODE_DISABLE_AGENT_VIEW=1".into(),
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1".into(),
+        "DISABLE_TELEMETRY=1".into(),
+        "MAX_THINKING_TOKENS=0".into(),
+    ];
+    if let Some(config_dir) = crumb_claude_config_dir() {
+        env.push(format!("CLAUDE_CONFIG_DIR={config_dir}"));
+    }
+    env
+}
+
+fn acp_agent_env_prefix() -> String {
+    acp_agent_env_args()
+        .into_iter()
+        .map(|assignment| shell_quote(&assignment))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '=' | ':'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn build_prompt(
+    messages: &[NormalizedMessage],
+    existing_actions: &[CanonicalActionItem],
+    existing_decisions: &[Decision],
+) -> Result<String> {
+    let existing_actions = existing_actions
+        .iter()
+        .map(ExistingActionForPrompt::from)
+        .collect::<Vec<_>>();
+    let existing_decisions = existing_decisions
+        .iter()
+        .map(ExistingDecisionForPrompt::from)
+        .collect::<Vec<_>>();
+    let existing_actions = serde_json::to_string(&existing_actions)?;
+    let existing_decisions = serde_json::to_string(&existing_decisions)?;
+
+    Ok(format!(
+        "{SYSTEM_PROMPT}\n\nAnalyze this Discord source transcript and extract decisions, action items, and a summary. Use the existing records to merge duplicates rather than creating new variants.\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript>\n{}\n</transcript>",
         format_transcript(messages)
-    )
+    ))
+}
+
+fn acp_session_meta() -> Map<String, Value> {
+    let model = crumb_ai_model();
+    let effort = crumb_ai_effort();
+    let mut env = Map::new();
+    env.insert("ANTHROPIC_MODEL".into(), Value::String(model.clone()));
+    env.insert(
+        "CLAUDE_CODE_EFFORT_LEVEL".into(),
+        Value::String(effort.clone()),
+    );
+    env.insert(
+        "CLAUDE_CODE_SUBAGENT_MODEL".into(),
+        Value::String(model.clone()),
+    );
+    env.insert(
+        "CLAUDE_CODE_DISABLE_CLAUDE_MDS".into(),
+        Value::String("1".into()),
+    );
+    env.insert(
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(),
+        Value::String("1".into()),
+    );
+    env.insert(
+        "CLAUDE_CODE_SKIP_PROMPT_HISTORY".into(),
+        Value::String("1".into()),
+    );
+    env.insert(
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(),
+        Value::String("1".into()),
+    );
+    env.insert(
+        "CLAUDE_CODE_DISABLE_AGENT_VIEW".into(),
+        Value::String("1".into()),
+    );
+    env.insert(
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
+        Value::String("1".into()),
+    );
+    env.insert("DISABLE_TELEMETRY".into(), Value::String("1".into()));
+    env.insert("MAX_THINKING_TOKENS".into(), Value::String("0".into()));
+    if let Some(config_dir) = crumb_claude_config_dir() {
+        env.insert("CLAUDE_CONFIG_DIR".into(), Value::String(config_dir));
+    }
+
+    let meta = json!({
+        "disableBuiltInTools": true,
+        "claudeCode": {
+            "options": {
+                "model": model,
+                "effortLevel": effort,
+                "settingSources": [],
+                "tools": [],
+                "disallowedTools": [
+                    "Bash",
+                    "Edit",
+                    "MultiEdit",
+                    "NotebookEdit",
+                    "Read",
+                    "Write",
+                    "WebFetch",
+                    "WebSearch"
+                ],
+                "settings": {
+                    "model": model,
+                    "availableModels": [model],
+                    "effortLevel": effort,
+                    "disableAllHooks": true,
+                    "disableBackgroundAgents": true,
+                    "alwaysThinkingEnabled": false
+                },
+                "env": env
+            }
+        }
+    });
+
+    match meta {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    }
+}
+
+fn crumb_ai_model() -> String {
+    let requested = std::env::var("CRUMB_AI_MODEL").unwrap_or_else(|_| "sonnet".into());
+    let normalized = requested.trim().to_lowercase();
+    if normalized.contains("sonnet") || normalized.contains("haiku") {
+        requested
+    } else {
+        tracing::warn!("unsupported CRUMB_AI_MODEL={requested}; falling back to sonnet");
+        "sonnet".into()
+    }
+}
+
+fn crumb_ai_effort() -> String {
+    let requested = std::env::var("CRUMB_AI_EFFORT").unwrap_or_else(|_| "low".into());
+    let normalized = requested.trim().to_lowercase();
+    if matches!(normalized.as_str(), "low" | "medium" | "high" | "xhigh") {
+        normalized
+    } else {
+        tracing::warn!("unsupported CRUMB_AI_EFFORT={requested}; falling back to low");
+        "low".into()
+    }
+}
+
+fn crumb_claude_config_dir() -> Option<String> {
+    std::env::var("CRUMB_CLAUDE_CONFIG_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingActionForPrompt<'a> {
+    id: &'a str,
+    title: &'a str,
+    status: &'a str,
+    assignee: Option<&'a str>,
+    due: Option<&'a str>,
+    latest_context: Option<&'a str>,
+}
+
+impl<'a> From<&'a CanonicalActionItem> for ExistingActionForPrompt<'a> {
+    fn from(item: &'a CanonicalActionItem) -> Self {
+        Self {
+            id: &item.id,
+            title: &item.title,
+            status: &item.status,
+            assignee: item.assignee.as_deref(),
+            due: item.due.as_deref(),
+            latest_context: item.latest_context.as_deref(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingDecisionForPrompt<'a> {
+    id: &'a str,
+    text: &'a str,
+    context: Option<&'a str>,
+    message_ids: &'a [String],
+}
+
+impl<'a> From<&'a Decision> for ExistingDecisionForPrompt<'a> {
+    fn from(item: &'a Decision) -> Self {
+        Self {
+            id: &item.id,
+            text: &item.text,
+            context: item.context.as_deref(),
+            message_ids: &item.message_ids,
+        }
+    }
 }
 
 fn format_transcript(messages: &[NormalizedMessage]) -> String {

@@ -74,27 +74,24 @@ export default function App() {
   return (
     <div className="popover">
       <header className="popover__header">
-        <div className="popover__heading">
-          <span className="popover__title">Crumb</span>
-          <nav className="popover__tabs">
-            <button
-              className={view === "actions" ? "popover__tab popover__tab--active" : "popover__tab"}
-              onClick={() => {
-                setView("actions");
-                setSelectedId(null);
-              }}
-            >
-              Actions
-            </button>
-            <button
-              className={view === "sources" ? "popover__tab popover__tab--active" : "popover__tab"}
-              onClick={() => setView("sources")}
-            >
-              Sources
-            </button>
-          </nav>
-        </div>
         <StatusDot status={status} />
+        <nav className="popover__tabs">
+          <button
+            className={view === "actions" ? "popover__tab popover__tab--active" : "popover__tab"}
+            onClick={() => {
+              setView("actions");
+              setSelectedId(null);
+            }}
+          >
+            Actions
+          </button>
+          <button
+            className={view === "sources" ? "popover__tab popover__tab--active" : "popover__tab"}
+            onClick={() => setView("sources")}
+          >
+            Sources
+          </button>
+        </nav>
       </header>
 
       <main className="popover__body">

@@ -6,14 +6,52 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use parking_lot::Mutex;
+use rusqlite::OptionalExtension;
 use serde_json;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 use crate::events::{ActionItem, CanonicalActionItem, Decision, ScrapeDetail, ScrapeSummary};
 
-const MIGRATION_SQL: &str = include_str!("../migrations/0001_init.sql");
+struct Migration {
+    id: &'static str,
+    sql: &'static str,
+    prepare: Option<fn(&rusqlite::Connection) -> Result<()>>,
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: "0001_init",
+        sql: include_str!("../migrations/0001_init.sql"),
+        prepare: None,
+    },
+    Migration {
+        id: "0002_action_item_dedupe",
+        sql: include_str!("../migrations/0002_action_item_dedupe.sql"),
+        prepare: Some(prepare_action_item_dedupe_migration),
+    },
+];
+
+#[derive(Debug, Clone)]
+pub struct DecisionCandidate {
+    pub text: String,
+    pub context: Option<String>,
+    pub message_ids: Vec<String>,
+    pub dedupe_key: Option<String>,
+    pub merge_with: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionCandidate {
+    pub text: String,
+    pub assignee: Option<String>,
+    pub due: Option<String>,
+    pub message_ids: Vec<String>,
+    pub dedupe_key: Option<String>,
+    pub merge_with: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct Db {
@@ -25,11 +63,11 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("creating db dir")?;
         }
-        let conn = rusqlite::Connection::open(path).context("opening sqlite")?;
+        let mut conn = rusqlite::Connection::open(path).context("opening sqlite")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(MIGRATION_SQL)
-            .context("running migration")?;
+        run_migrations(&mut conn).context("running migrations")?;
+        consolidate_existing_actions(&mut conn).context("consolidating action duplicates")?;
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })
@@ -40,7 +78,14 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, source, channel_id, channel_name, guild_id, guild_name,
                     triggered_by, triggered_at, status, message_count, summary, error
-             FROM scrapes ORDER BY triggered_at DESC LIMIT 200",
+             FROM scrapes s
+             WHERE s.triggered_at = (
+                 SELECT MAX(triggered_at)
+                 FROM scrapes latest
+                 WHERE latest.source = s.source
+                   AND latest.channel_id = s.channel_id
+             )
+             ORDER BY triggered_at DESC LIMIT 200",
         )?;
         let result = stmt
             .query_map([], row_to_summary)?
@@ -144,6 +189,45 @@ impl Db {
         }))
     }
 
+    pub fn list_source_actions(
+        &self,
+        source_kind: &str,
+        source_scope: &str,
+    ) -> Result<Vec<CanonicalActionItem>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.title, a.status, a.source_kind, a.source_scope, a.source_label,
+                    a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
+                    a.last_seen_at, a.completed_at, a.snoozed_until, a.latest_context,
+                    COUNT(e.id) AS evidence_count
+             FROM canonical_action_items a
+             LEFT JOIN action_item_evidence e ON e.action_item_id = a.id
+             WHERE a.source_kind = ? AND a.source_scope = ?
+             GROUP BY a.id
+             ORDER BY a.status IN ('done','archived'), a.last_seen_at DESC
+             LIMIT 100",
+        )?;
+        let result = stmt
+            .query_map(
+                rusqlite::params![source_kind, source_scope],
+                row_to_canonical_action,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+
+    pub fn list_source_decisions(&self, source_id: &str) -> Result<Vec<Decision>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, scrape_id, text, context, message_ids, created_at
+             FROM decisions WHERE scrape_id = ? ORDER BY created_at",
+        )?;
+        let result = stmt
+            .query_map([source_id], row_to_decision)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+
     pub fn insert_running(
         &self,
         id: &str,
@@ -158,7 +242,16 @@ impl Db {
         conn.execute(
             "INSERT INTO scrapes (id, source, channel_id, channel_name, guild_id, guild_name,
                                   triggered_by, triggered_at, status)
-             VALUES (?, 'discord', ?, ?, ?, ?, ?, ?, 'running')",
+             VALUES (?, 'discord', ?, ?, ?, ?, ?, ?, 'running')
+             ON CONFLICT(id) DO UPDATE SET
+               channel_id = excluded.channel_id,
+               channel_name = excluded.channel_name,
+               guild_id = excluded.guild_id,
+               guild_name = excluded.guild_name,
+               triggered_by = excluded.triggered_by,
+               triggered_at = excluded.triggered_at,
+               status = 'running',
+               error = NULL",
             rusqlite::params![
                 id,
                 channel_id,
@@ -169,20 +262,10 @@ impl Db {
                 now
             ],
         )?;
-        Ok(ScrapeSummary {
-            id: id.into(),
-            source: "discord".into(),
-            channel_id: channel_id.into(),
-            channel_name: channel_name.map(Into::into),
-            guild_id: guild_id.map(Into::into),
-            guild_name: guild_name.map(Into::into),
-            triggered_by: triggered_by.into(),
-            triggered_at: now,
-            status: "running".into(),
-            message_count: None,
-            summary: None,
-            error: None,
-        })
+        drop(conn);
+        self.get_scrape(id)?
+            .map(|d| d.scrape)
+            .context("source vanished after insert")
     }
 
     pub fn mark_extracted(
@@ -190,8 +273,8 @@ impl Db {
         scrape_id: &str,
         message_count: i64,
         summary: &str,
-        decisions: &[(String, Option<String>, Vec<String>)],
-        action_items: &[(String, Option<String>, Option<String>, Vec<String>)],
+        decisions: &[DecisionCandidate],
+        action_items: &[ActionCandidate],
     ) -> Result<ScrapeSummary> {
         let mut conn = self.inner.lock();
         let now = Utc::now().timestamp_millis();
@@ -215,51 +298,90 @@ impl Db {
             "UPDATE scrapes SET status='extracted', message_count=?, summary=?, error=NULL WHERE id=?",
             rusqlite::params![message_count, summary, scrape_id],
         )?;
-        tx.execute("DELETE FROM decisions WHERE scrape_id=?", [scrape_id])?;
-        tx.execute("DELETE FROM action_items WHERE scrape_id=?", [scrape_id])?;
-        for (text, context, msg_ids) in decisions {
-            let ids = serde_json::to_string(msg_ids)?;
+        for decision in decisions {
+            let ids = serde_json::to_string(&decision.message_ids)?;
+            let dedupe_key = decision_item_key(
+                decision.dedupe_key.as_deref(),
+                decision.merge_with.as_deref(),
+                &decision.text,
+                &decision.message_ids,
+            );
+            if let Some(decision_id) =
+                valid_decision_merge_target(&tx, scrape_id, decision.merge_with.as_deref())?
+            {
+                tx.execute(
+                    "UPDATE decisions
+                     SET text = ?,
+                         context = COALESCE(?, context),
+                         message_ids = ?,
+                         dedupe_key = COALESCE(dedupe_key, ?)
+                     WHERE id = ?",
+                    rusqlite::params![
+                        decision.text.as_str(),
+                        decision.context.as_deref(),
+                        ids,
+                        dedupe_key,
+                        decision_id
+                    ],
+                )?;
+                continue;
+            }
             tx.execute(
-                "INSERT INTO decisions (id, scrape_id, text, context, message_ids, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO decisions (id, scrape_id, text, context, message_ids, created_at, dedupe_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(scrape_id, dedupe_key) DO UPDATE SET
+                   text = excluded.text,
+                   context = COALESCE(excluded.context, decisions.context),
+                   message_ids = excluded.message_ids",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     scrape_id,
-                    text,
-                    context,
+                    decision.text.as_str(),
+                    decision.context.as_deref(),
                     ids,
-                    now
+                    now,
+                    dedupe_key
                 ],
             )?;
         }
-        for (text, assignee, due, msg_ids) in action_items {
-            let ids = serde_json::to_string(msg_ids)?;
-            tx.execute(
-                "INSERT INTO action_items (id, scrape_id, text, assignee, due, message_ids, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                rusqlite::params![
-                    uuid::Uuid::new_v4().to_string(),
-                    scrape_id,
-                    text,
-                    assignee,
-                    due,
-                    ids,
-                    now
-                ],
-            )?;
-            upsert_canonical_action(
+        for action in action_items {
+            let ids = serde_json::to_string(&action.message_ids)?;
+            let canonical_id = upsert_canonical_action(
                 &tx,
                 now,
                 "discord",
                 &channel_id,
                 &source_label,
                 scrape_id,
-                text,
-                assignee.as_deref(),
-                due.as_deref(),
-                msg_ids,
+                &action.text,
+                action.assignee.as_deref(),
+                action.due.as_deref(),
+                action.dedupe_key.as_deref(),
+                action.merge_with.as_deref(),
+                &action.message_ids,
+            )?;
+            let item_key = format!("canonical:{canonical_id}");
+            tx.execute(
+                "INSERT INTO action_items (id, scrape_id, text, assignee, due, message_ids, created_at, dedupe_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(scrape_id, dedupe_key) DO UPDATE SET
+                   text = excluded.text,
+                   assignee = COALESCE(excluded.assignee, action_items.assignee),
+                   due = COALESCE(excluded.due, action_items.due),
+                   message_ids = excluded.message_ids",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    scrape_id,
+                    action.text.as_str(),
+                    action.assignee.as_deref(),
+                    action.due.as_deref(),
+                    ids,
+                    now,
+                    item_key
+                ],
             )?;
         }
+        merge_similar_canonical_actions(&tx, "discord", &channel_id)?;
         tx.commit()?;
         drop(conn);
         // Re-read the row to return the canonical state.
@@ -310,6 +432,113 @@ pub fn resolve_db_path(app: &AppHandle) -> Result<PathBuf> {
         .app_data_dir()
         .context("resolving app data dir")?;
     Ok(dir.join("crumb.db"))
+}
+
+fn run_migrations(conn: &mut rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+           id         TEXT PRIMARY KEY,
+           applied_at INTEGER NOT NULL
+         );",
+    )?;
+
+    for migration in MIGRATIONS {
+        let already_applied = conn
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE id = ?",
+                [migration.id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if already_applied {
+            continue;
+        }
+
+        let tx = conn.transaction()?;
+        if let Some(prepare) = migration.prepare {
+            prepare(&tx)?;
+        }
+        tx.execute_batch(migration.sql)
+            .with_context(|| format!("running migration {}", migration.id))?;
+        tx.execute(
+            "INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)",
+            rusqlite::params![migration.id, Utc::now().timestamp_millis()],
+        )?;
+        tx.commit()
+            .with_context(|| format!("committing migration {}", migration.id))?;
+    }
+
+    Ok(())
+}
+
+fn prepare_action_item_dedupe_migration(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(conn, "decisions", "dedupe_key", "TEXT")?;
+    ensure_column(conn, "action_items", "dedupe_key", "TEXT")?;
+    dedupe_source_rows(conn, "decisions")?;
+    dedupe_source_rows(conn, "action_items")?;
+    Ok(())
+}
+
+fn dedupe_source_rows(conn: &rusqlite::Connection, table: &str) -> Result<()> {
+    conn.execute(
+        &format!(
+            "DELETE FROM {table}
+             WHERE dedupe_key IS NOT NULL
+               AND rowid NOT IN (
+                 SELECT MIN(rowid)
+                 FROM {table}
+                 GROUP BY scrape_id, dedupe_key
+               )"
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn consolidate_existing_actions(conn: &mut rusqlite::Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    let sources = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT source_kind, source_scope
+             FROM canonical_action_items
+             WHERE status IN ('inbox','active','snoozed','done')",
+        )?;
+        let collected = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        collected
+    };
+
+    for (source_kind, source_scope) in sources {
+        merge_similar_canonical_actions(&tx, &source_kind, &source_scope)?;
+    }
+
+    tx.commit()?;
+    Ok(())
 }
 
 fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScrapeSummary> {
@@ -393,22 +622,57 @@ fn upsert_canonical_action(
     text: &str,
     assignee: Option<&str>,
     due: Option<&str>,
+    ai_dedupe_key: Option<&str>,
+    merge_with: Option<&str>,
     message_ids: &[String],
-) -> Result<()> {
-    let dedupe_key = normalize_action_key(text);
+) -> Result<String> {
+    if let Some(action_id) = valid_merge_target(tx, source_kind, source_scope, merge_with)? {
+        update_canonical_action(tx, &action_id, now, source_label, text, assignee, due)?;
+        insert_action_evidence(
+            tx,
+            now,
+            &action_id,
+            source_kind,
+            source_scope,
+            source_label,
+            scrape_id,
+            text,
+            message_ids,
+        )?;
+        return Ok(action_id);
+    }
+
+    if let Some(action_id) = find_similar_action_id(tx, source_kind, source_scope, text)? {
+        update_canonical_action(tx, &action_id, now, source_label, text, assignee, due)?;
+        insert_action_evidence(
+            tx,
+            now,
+            &action_id,
+            source_kind,
+            source_scope,
+            source_label,
+            scrape_id,
+            text,
+            message_ids,
+        )?;
+        return Ok(action_id);
+    }
+
+    let dedupe_key = normalize_key(ai_dedupe_key.unwrap_or(text));
     if dedupe_key.is_empty() {
-        return Ok(());
+        bail!("action item dedupe key is empty");
     }
 
     tx.execute(
         "INSERT INTO canonical_action_items (
            id, title, status, source_kind, source_scope, source_label, dedupe_key,
-           assignee, due, priority, relevance_score, first_seen_at, last_seen_at
+           assignee, due, priority, relevance_score, first_seen_at, last_seen_at, latest_context
          )
-         VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+         VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
          ON CONFLICT(source_kind, source_scope, dedupe_key) DO UPDATE SET
            last_seen_at = excluded.last_seen_at,
            source_label = excluded.source_label,
+           latest_context = excluded.latest_context,
            assignee = COALESCE(canonical_action_items.assignee, excluded.assignee),
            due = COALESCE(canonical_action_items.due, excluded.due),
            title = CASE
@@ -426,7 +690,8 @@ fn upsert_canonical_action(
             assignee,
             due,
             now,
-            now
+            now,
+            text
         ],
     )?;
 
@@ -437,9 +702,72 @@ fn upsert_canonical_action(
         |row| row.get(0),
     )?;
 
+    insert_action_evidence(
+        tx,
+        now,
+        &action_id,
+        source_kind,
+        source_scope,
+        source_label,
+        scrape_id,
+        text,
+        message_ids,
+    )?;
+
+    Ok(action_id)
+}
+
+fn update_canonical_action(
+    tx: &rusqlite::Transaction<'_>,
+    action_id: &str,
+    now: i64,
+    source_label: &str,
+    text: &str,
+    assignee: Option<&str>,
+    due: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE canonical_action_items
+         SET last_seen_at = ?,
+             source_label = ?,
+             latest_context = ?,
+             assignee = COALESCE(canonical_action_items.assignee, ?),
+             due = COALESCE(canonical_action_items.due, ?),
+             title = CASE
+               WHEN length(?) < length(canonical_action_items.title)
+               THEN ?
+               ELSE canonical_action_items.title
+             END
+         WHERE id = ?",
+        rusqlite::params![
+            now,
+            source_label,
+            text,
+            assignee,
+            due,
+            text,
+            text,
+            action_id
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn insert_action_evidence(
+    tx: &rusqlite::Transaction<'_>,
+    now: i64,
+    action_id: &str,
+    source_kind: &str,
+    source_scope: &str,
+    source_label: &str,
+    scrape_id: &str,
+    text: &str,
+    message_ids: &[String],
+) -> Result<()> {
     let message_json = serde_json::to_string(message_ids)?;
     let evidence_key = if message_ids.is_empty() {
-        format!("text:{dedupe_key}")
+        format!("text:{}", normalize_key(text))
     } else {
         let mut stable_message_ids = message_ids.to_vec();
         stable_message_ids.sort();
@@ -468,6 +796,168 @@ fn upsert_canonical_action(
     Ok(())
 }
 
+fn valid_merge_target(
+    tx: &rusqlite::Transaction<'_>,
+    source_kind: &str,
+    source_scope: &str,
+    merge_with: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(merge_with) = merge_with.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+
+    let found = tx
+        .query_row(
+            "SELECT id FROM canonical_action_items
+             WHERE id = ? AND source_kind = ? AND source_scope = ?",
+            rusqlite::params![merge_with, source_kind, source_scope],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found)
+}
+
+fn valid_decision_merge_target(
+    tx: &rusqlite::Transaction<'_>,
+    scrape_id: &str,
+    merge_with: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(merge_with) = merge_with.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+
+    let found = tx
+        .query_row(
+            "SELECT id FROM decisions WHERE id = ? AND scrape_id = ?",
+            rusqlite::params![merge_with, scrape_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found)
+}
+
+fn find_similar_action_id(
+    tx: &rusqlite::Transaction<'_>,
+    source_kind: &str,
+    source_scope: &str,
+    text: &str,
+) -> Result<Option<String>> {
+    let incoming = action_tokens(text);
+    if incoming.len() < 3 {
+        return Ok(None);
+    }
+
+    let mut stmt = tx.prepare(
+        "SELECT id, title FROM canonical_action_items
+         WHERE source_kind = ? AND source_scope = ?
+           AND status IN ('inbox','active','snoozed','done')",
+    )?;
+    let existing = stmt
+        .query_map(rusqlite::params![source_kind, source_scope], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut best: Option<(String, f64)> = None;
+    for (id, title) in existing {
+        let score = token_similarity(&incoming, &action_tokens(&title));
+        if score >= 0.66
+            && best
+                .as_ref()
+                .map_or(true, |(_, best_score)| score > *best_score)
+        {
+            best = Some((id, score));
+        }
+    }
+
+    Ok(best.map(|(id, _)| id))
+}
+
+fn merge_similar_canonical_actions(
+    tx: &rusqlite::Transaction<'_>,
+    source_kind: &str,
+    source_scope: &str,
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT id, title, status, first_seen_at, last_seen_at
+         FROM canonical_action_items
+         WHERE source_kind = ? AND source_scope = ?
+           AND status IN ('inbox','active','snoozed','done')
+         ORDER BY first_seen_at ASC",
+    )?;
+    let actions = stmt
+        .query_map(rusqlite::params![source_kind, source_scope], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut removed = HashSet::new();
+    for i in 0..actions.len() {
+        if removed.contains(&actions[i].0) {
+            continue;
+        }
+        let keep_id = &actions[i].0;
+        let keep_tokens = action_tokens(&actions[i].1);
+        if keep_tokens.len() < 3 {
+            continue;
+        }
+
+        for candidate in actions.iter().skip(i + 1) {
+            if removed.contains(&candidate.0) {
+                continue;
+            }
+            let score = token_similarity(&keep_tokens, &action_tokens(&candidate.1));
+            if score < 0.72 {
+                continue;
+            }
+
+            merge_canonical_action(tx, keep_id, &candidate.0)?;
+            removed.insert(candidate.0.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_canonical_action(
+    tx: &rusqlite::Transaction<'_>,
+    keep_id: &str,
+    duplicate_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE OR IGNORE action_item_evidence SET action_item_id = ? WHERE action_item_id = ?",
+        rusqlite::params![keep_id, duplicate_id],
+    )?;
+    tx.execute(
+        "DELETE FROM action_item_evidence WHERE action_item_id = ?",
+        [duplicate_id],
+    )?;
+    tx.execute(
+        "UPDATE OR IGNORE action_items
+         SET dedupe_key = ?
+         WHERE dedupe_key = ?",
+        rusqlite::params![
+            format!("canonical:{keep_id}"),
+            format!("canonical:{duplicate_id}")
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM action_items WHERE dedupe_key = ?",
+        [format!("canonical:{duplicate_id}")],
+    )?;
+    tx.execute(
+        "DELETE FROM canonical_action_items WHERE id = ?",
+        [duplicate_id],
+    )?;
+    Ok(())
+}
+
 fn format_source_label(
     guild_name: Option<&str>,
     channel_name: Option<&str>,
@@ -481,7 +971,7 @@ fn format_source_label(
     }
 }
 
-fn normalize_action_key(text: &str) -> String {
+fn normalize_key(text: &str) -> String {
     let lowered = text.to_lowercase();
     let mut normalized = String::with_capacity(lowered.len());
     let mut last_was_space = false;
@@ -517,6 +1007,76 @@ fn normalize_action_key(text: &str) -> String {
     trimmed.to_string()
 }
 
+fn decision_item_key(
+    ai_dedupe_key: Option<&str>,
+    merge_with: Option<&str>,
+    text: &str,
+    message_ids: &[String],
+) -> String {
+    if let Some(merge_with) = merge_with.map(str::trim).filter(|value| !value.is_empty()) {
+        return format!("decision:{merge_with}");
+    }
+    if let Some(ai_dedupe_key) = ai_dedupe_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return normalize_key(ai_dedupe_key);
+    }
+    item_key_from_messages_or_text("decision", text, message_ids)
+}
+
+fn item_key_from_messages_or_text(kind: &str, text: &str, message_ids: &[String]) -> String {
+    if message_ids.is_empty() {
+        return normalize_key(text);
+    }
+    let mut stable_message_ids = message_ids.to_vec();
+    stable_message_ids.sort();
+    format!("{kind}:{}", stable_message_ids.join(","))
+}
+
+fn action_tokens(text: &str) -> HashSet<String> {
+    normalize_key(text)
+        .split_whitespace()
+        .filter(|token| {
+            token.len() > 2
+                && !matches!(
+                    *token,
+                    "the"
+                        | "and"
+                        | "for"
+                        | "with"
+                        | "that"
+                        | "this"
+                        | "into"
+                        | "onto"
+                        | "from"
+                        | "about"
+                        | "should"
+                        | "would"
+                        | "could"
+                        | "will"
+                        | "need"
+                        | "needs"
+                        | "add"
+                        | "send"
+                        | "provide"
+                        | "sync"
+                        | "make"
+                )
+        })
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn token_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count() as f64;
+    let smaller = a.len().min(b.len()) as f64;
+    intersection / smaller
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,13 +1084,172 @@ mod tests {
     #[test]
     fn action_key_normalization_strips_common_prefixes() {
         assert_eq!(
-            normalize_action_key("Need to ship the menu bar UX."),
+            normalize_key("Need to ship the menu bar UX."),
             "ship the menu bar ux"
         );
         assert_eq!(
-            normalize_action_key("Follow up on Discord scraper retries"),
+            normalize_key("Follow up on Discord scraper retries"),
             "discord scraper retries"
         );
+    }
+
+    #[test]
+    fn opening_legacy_db_adds_dedupe_columns_before_indexes() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-legacy-migration-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE scrapes (
+                   id            TEXT PRIMARY KEY,
+                   source        TEXT NOT NULL CHECK(source IN ('discord')),
+                   channel_id    TEXT NOT NULL,
+                   channel_name  TEXT,
+                   guild_id      TEXT,
+                   guild_name    TEXT,
+                   triggered_by  TEXT NOT NULL,
+                   triggered_at  INTEGER NOT NULL,
+                   status        TEXT NOT NULL CHECK(status IN ('running','extracted','failed')),
+                   message_count INTEGER,
+                   summary       TEXT,
+                   error         TEXT
+                 );
+                 CREATE TABLE decisions (
+                   id          TEXT PRIMARY KEY,
+                   scrape_id   TEXT NOT NULL REFERENCES scrapes(id) ON DELETE CASCADE,
+                   text        TEXT NOT NULL,
+                   context     TEXT,
+                   message_ids TEXT,
+                   created_at  INTEGER NOT NULL
+                 );
+                 CREATE TABLE action_items (
+                   id          TEXT PRIMARY KEY,
+                   scrape_id   TEXT NOT NULL REFERENCES scrapes(id) ON DELETE CASCADE,
+                   text        TEXT NOT NULL,
+                   assignee    TEXT,
+                   due         TEXT,
+                   message_ids TEXT,
+                   created_at  INTEGER NOT NULL
+                 );",
+            )?;
+        }
+
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:legacy-channel",
+            "legacy-channel",
+            Some("legacy"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:legacy-channel",
+            1,
+            "summary",
+            &[DecisionCandidate {
+                text: "Keep migrating old Crumb databases.".into(),
+                context: None,
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("migrate-old-dbs".into()),
+                merge_with: None,
+            }],
+            &[ActionCandidate {
+                text: "Verify old Crumb databases migrate at startup".into(),
+                assignee: None,
+                due: None,
+                message_ids: vec!["message-2".into()],
+                dedupe_key: Some("verify-old-dbs-migrate".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let sources = db.list_scrapes()?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(db.list_open_action_items()?.len(), 1);
+
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let applied = applied_migrations(&conn)?;
+        assert_eq!(applied, vec!["0001_init", "0002_action_item_dedupe"]);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn action_dedupe_migration_removes_duplicate_source_rows_before_indexing() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-duplicate-source-rows-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE scrapes (
+                   id            TEXT PRIMARY KEY,
+                   source        TEXT NOT NULL CHECK(source IN ('discord')),
+                   channel_id    TEXT NOT NULL,
+                   channel_name  TEXT,
+                   guild_id      TEXT,
+                   guild_name    TEXT,
+                   triggered_by  TEXT NOT NULL,
+                   triggered_at  INTEGER NOT NULL,
+                   status        TEXT NOT NULL CHECK(status IN ('running','extracted','failed')),
+                   message_count INTEGER,
+                   summary       TEXT,
+                   error         TEXT
+                 );
+                 CREATE TABLE decisions (
+                   id          TEXT PRIMARY KEY,
+                   scrape_id   TEXT NOT NULL REFERENCES scrapes(id) ON DELETE CASCADE,
+                   text        TEXT NOT NULL,
+                   context     TEXT,
+                   message_ids TEXT,
+                   created_at  INTEGER NOT NULL,
+                   dedupe_key  TEXT
+                 );
+                 CREATE TABLE action_items (
+                   id          TEXT PRIMARY KEY,
+                   scrape_id   TEXT NOT NULL REFERENCES scrapes(id) ON DELETE CASCADE,
+                   text        TEXT NOT NULL,
+                   assignee    TEXT,
+                   due         TEXT,
+                   message_ids TEXT,
+                   created_at  INTEGER NOT NULL,
+                   dedupe_key  TEXT
+                 );
+                 INSERT INTO scrapes (
+                   id, source, channel_id, triggered_by, triggered_at, status,
+                   message_count, summary
+                 )
+                 VALUES ('scrape-1', 'discord', 'channel-1', 'tester', 1,
+                         'extracted', 2, 'summary');
+                 INSERT INTO decisions (id, scrape_id, text, created_at, dedupe_key)
+                 VALUES
+                   ('decision-1', 'scrape-1', 'Decision', 1, 'same-decision'),
+                   ('decision-2', 'scrape-1', 'Decision duplicate', 2, 'same-decision');
+                 INSERT INTO action_items (id, scrape_id, text, created_at, dedupe_key)
+                 VALUES
+                   ('action-1', 'scrape-1', 'Action', 1, 'same-action'),
+                   ('action-2', 'scrape-1', 'Action duplicate', 2, 'same-action');",
+            )?;
+        }
+
+        let db = Db::open(&db_path)?;
+        let detail = db.get_scrape("scrape-1")?.expect("scrape exists");
+        assert_eq!(detail.decisions.len(), 1);
+        assert_eq!(detail.action_items.len(), 1);
+
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let applied = applied_migrations(&conn)?;
+        assert_eq!(applied, vec!["0001_init", "0002_action_item_dedupe"]);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
     }
 
     #[test]
@@ -551,12 +1270,14 @@ mod tests {
             1,
             "summary",
             &[],
-            &[(
-                "Need to ship the menu bar UX".into(),
-                Some("fox".into()),
-                None,
-                vec!["message-1".into()],
-            )],
+            &[ActionCandidate {
+                text: "Need to ship the menu bar UX".into(),
+                assignee: Some("fox".into()),
+                due: None,
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("ship menu bar ux".into()),
+                merge_with: None,
+            }],
         )?;
 
         db.insert_running(
@@ -572,12 +1293,14 @@ mod tests {
             1,
             "summary",
             &[],
-            &[(
-                "Need to ship the menu bar UX".into(),
-                Some("fox".into()),
-                None,
-                vec!["message-1".into()],
-            )],
+            &[ActionCandidate {
+                text: "Ship the menu bar UX".into(),
+                assignee: Some("fox".into()),
+                due: None,
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("ship menu bar ux".into()),
+                merge_with: None,
+            }],
         )?;
 
         let actions = db.list_open_action_items()?;
@@ -586,5 +1309,101 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
+    }
+
+    #[test]
+    fn repeated_source_scrapes_accumulate_items_without_source_duplicates() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-source-upsert-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            1,
+            "first summary",
+            &[DecisionCandidate {
+                text: "Ship the menu bar first.".into(),
+                context: Some("ship it".into()),
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("ship-menu-bar".into()),
+                merge_with: None,
+            }],
+            &[ActionCandidate {
+                text: "Provide Lew with partner user IDs for experiment whitelisting".into(),
+                assignee: Some("Arthur Tang".into()),
+                due: Some("this week".into()),
+                message_ids: vec!["message-2".into()],
+                dedupe_key: Some("partner-user-ids-for-whitelisting".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            2,
+            "second summary",
+            &[DecisionCandidate {
+                text: "Ship the menu bar first.".into(),
+                context: Some("ship it".into()),
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("ship-menu-bar".into()),
+                merge_with: None,
+            }],
+            &[
+                ActionCandidate {
+                    text: "Provide Lew with the partner user IDs and application IDs to add to the experiment.".into(),
+                    assignee: Some("Arthur Tang".into()),
+                    due: Some("this week".into()),
+                    message_ids: vec!["message-2".into()],
+                    dedupe_key: Some("partner-user-ids-for-experiment".into()),
+                    merge_with: None,
+                },
+                ActionCandidate {
+                    text: "Add screenshots to partner docs".into(),
+                    assignee: Some("Anthony".into()),
+                    due: Some("today".into()),
+                    message_ids: vec!["message-3".into()],
+                    dedupe_key: Some("add-screenshots-to-partner-docs".into()),
+                    merge_with: None,
+                },
+            ],
+        )?;
+
+        let sources = db.list_scrapes()?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "discord:channel-1");
+
+        let detail = db.get_scrape("discord:channel-1")?.expect("source exists");
+        assert_eq!(detail.decisions.len(), 1);
+        assert_eq!(detail.action_items.len(), 2);
+
+        let actions = db.list_open_action_items()?;
+        assert_eq!(actions.len(), 2);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    fn applied_migrations(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT id FROM schema_migrations ORDER BY applied_at, id")?;
+        let applied = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(applied)
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, watch};
 
 use crate::ai;
-use crate::db::Db;
+use crate::db::{ActionCandidate, Db, DecisionCandidate};
 use crate::discord::{DiscordBot, DiscordScraper, ScrapeRequest};
 use crate::events::SidecarStatus;
 
@@ -183,7 +183,22 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
             ))
             .await;
 
-        let extracted = ai::extract(&messages).await?;
+        let existing_actions = db
+            .list_source_actions("discord", &req.channel_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to load existing source actions: {e}");
+                Vec::new()
+            });
+        let existing_decisions = db
+            .list_source_decisions(&req.scrape_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to load existing source decisions: {e}");
+                Vec::new()
+            });
+
+        let extracted = ai::extract(&messages, &existing_actions, &existing_decisions)
+            .await
+            .context("Claude extraction failed")?;
         Ok::<_, anyhow::Error>((messages, extracted))
     }
     .await;
@@ -193,12 +208,25 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
             let decisions: Vec<_> = extracted
                 .decisions
                 .into_iter()
-                .map(|d| (d.text, d.context, d.message_ids.unwrap_or_default()))
+                .map(|d| DecisionCandidate {
+                    text: d.text,
+                    context: d.context,
+                    message_ids: d.message_ids.unwrap_or_default(),
+                    dedupe_key: d.dedupe_key,
+                    merge_with: d.merge_with,
+                })
                 .collect();
             let action_items: Vec<_> = extracted
                 .action_items
                 .into_iter()
-                .map(|a| (a.text, a.assignee, a.due, a.message_ids.unwrap_or_default()))
+                .map(|a| ActionCandidate {
+                    text: a.text,
+                    assignee: a.assignee,
+                    due: a.due,
+                    message_ids: a.message_ids.unwrap_or_default(),
+                    dedupe_key: a.dedupe_key,
+                    merge_with: a.merge_with,
+                })
                 .collect();
 
             match db.mark_extracted(
@@ -234,11 +262,19 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
         }
         Err(e) => {
             let msg = e.to_string();
+            let user_msg = user_facing_scrape_error(&msg);
             tracing::error!("scrape failed: {msg}");
-            emit_failed(&app, &db, &req.scrape_id, &msg);
-            let _ = req.reply.send(format!("Scrape failed: {msg}")).await;
+            emit_failed(&app, &db, &req.scrape_id, &user_msg);
+            let _ = req.reply.send(format!("Scrape failed: {user_msg}")).await;
         }
     }
+}
+
+fn user_facing_scrape_error(error: &str) -> String {
+    if error.contains("Authentication required") {
+        return "Claude Code authentication is required for extraction. Run `claude` in a terminal and complete login, or unset/fix `CRUMB_CLAUDE_CONFIG_DIR` if it points at an unauthenticated config.".into();
+    }
+    error.into()
 }
 
 fn emit_failed(app: &AppHandle, db: &Db, scrape_id: &str, error: &str) {

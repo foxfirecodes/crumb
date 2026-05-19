@@ -100,7 +100,26 @@ DISCORD_BOT_TOKEN=…
 DISCORD_USER_TOKEN=…
 ```
 
-> **No `ANTHROPIC_API_KEY` needed.** Crumb is an ACP client. By default it connects to Claude Code through the pinned command `npx -y @agentclientprotocol/claude-agent-acp@0.33.1`, which reuses your existing Claude Code auth. Set `CRUMB_ACP_AGENT_COMMAND` if you want to point at an already-installed ACP agent binary.
+> **No `ANTHROPIC_API_KEY` needed.** Crumb is an ACP client. By default it connects to Claude Code through the pinned command `npx -y @agentclientprotocol/claude-agent-acp@0.33.1`, which reuses your existing Claude Code auth.
+
+Optional AI settings:
+
+```
+# Defaults to sonnet. Only sonnet/haiku model names are accepted.
+CRUMB_AI_MODEL=sonnet
+
+# Defaults to low for fast extraction. Use medium if dedupe quality drops.
+CRUMB_AI_EFFORT=low
+
+# Optional: point Crumb at a fully separate Claude config/auth directory.
+# If you set this, that directory needs its own Claude auth.
+CRUMB_CLAUDE_CONFIG_DIR=/path/to/crumb-claude-config
+
+# Optional: point at another ACP-compatible agent command.
+CRUMB_ACP_AGENT_COMMAND="npx -y @agentclientprotocol/claude-agent-acp@0.33.1"
+```
+
+Crumb passes Claude Code session options and environment variables to use the configured model/effort and disable project/user setting sources, hooks, tools, prompt history, and memory for extraction sessions. By default it does not override `CLAUDE_CONFIG_DIR`, so the ACP connector can reuse your normal Claude Code auth. If you set `CRUMB_CLAUDE_CONFIG_DIR`, that directory must already be logged into Claude Code.
 
 Make sure `.env` is gitignored before you put real values in. Crumb will refuse to start if any Discord vars are missing or look obviously malformed.
 

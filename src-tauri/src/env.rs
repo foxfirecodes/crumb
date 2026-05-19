@@ -37,11 +37,25 @@ pub fn load_discord_env(
             "DISCORD_BOT_TOKEN" => bot = value,
             "DISCORD_APP_ID" => app_id = value,
             "DISCORD_USER_TOKEN" => user = value,
+            "CRUMB_AI_MODEL"
+            | "CRUMB_AI_EFFORT"
+            | "CRUMB_CLAUDE_CONFIG_DIR"
+            | "CRUMB_ACP_AGENT_COMMAND" => {
+                if let Some(value) = value {
+                    set_env_if_unset(k.trim(), &value);
+                }
+            }
             _ => {}
         }
     }
 
     Ok((bot, app_id, user))
+}
+
+fn set_env_if_unset(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
 }
 
 /// In dev: repo root (cwd's parent if cwd is src-tauri, else cwd).

@@ -268,9 +268,10 @@ impl DiscordBot {
                     .map(format_user_tag)
                     .unwrap_or_else(|| "unknown".into());
 
+                let channel_id = interaction.channel_id;
                 let req = ScrapeRequest {
-                    scrape_id: uuid::Uuid::new_v4().to_string(),
-                    channel_id: interaction.channel_id,
+                    scrape_id: format!("discord:{channel_id}"),
+                    channel_id,
                     channel_name: interaction.channel.and_then(|c| c.name),
                     guild_id: interaction.guild_id,
                     guild_name: interaction.guild.and_then(|g| g.name),

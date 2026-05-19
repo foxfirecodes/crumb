@@ -8,7 +8,7 @@ The menu bar opens to **Actions**.
 
 Actions should answer: "What do I actually need to do?"
 
-The secondary view is **Sources**. Sources are the places Crumb learned from: Discord channels or threads, Asana tasks, future Notion pages, manual notes, and scrape/poll runs. Source detail views preserve the thread/scrape context without making that history the main workflow.
+The secondary view is **Sources**. Sources are the places Crumb learned from: Discord channels or threads, Asana tasks, future Notion pages, and manual notes. Re-scraping a source updates that source; it does not create a new top-level Source row. Source detail views preserve the thread/source context without making that history the main workflow.
 
 ## Data Model
 
@@ -63,35 +63,40 @@ Every source ingestion path produces candidates:
 ```text
 source scrape/poll/manual entry
 -> extracted candidates
+-> AI reconciliation against existing source items
 -> reconcile with canonical action items
 -> upsert action items and evidence
 -> refresh Actions view
 ```
 
-Scrape history remains available under Sources.
+Source history remains available under Sources as accumulated decisions, action candidates, and evidence.
 
 ## Dedupe
 
-Initial dedupe is deterministic and source-scoped:
+Initial dedupe is AI-assisted and source-scoped, with deterministic guardrails:
 
 1. Build a `source_scope`.
    - Discord: channel ID for MVP.
    - Asana: task ID when available, otherwise project/workspace.
    - Manual: manual namespace.
-2. Normalize action text:
+2. Send existing source actions/decisions to the AI extraction pass.
+   - If a candidate is the same real-world task as an existing item, the AI returns `merge_with`.
+   - The AI also returns a stable semantic `dedupe_key`.
+3. Normalize action text as a fallback:
    - lowercase
    - trim punctuation/noise
    - collapse whitespace
    - strip common commitment prefixes where safe
-3. Upsert by `(source_kind, source_scope, dedupe_key)`.
-4. If a match exists:
+4. Upsert by explicit `merge_with`, otherwise `(source_kind, source_scope, dedupe_key)`.
+5. Run a conservative source-local token-similarity merge to catch obvious wording variants.
+6. If a match exists:
    - preserve status
    - update `last_seen_at`
    - fill missing assignee/due
    - append evidence
-5. If no match exists, create a new canonical action item.
+7. If no match exists, create a new canonical action item.
 
-Future semantic dedupe can run after deterministic matching. It should compare only a small candidate set: same source/project, open statuses, recent `last_seen_at`, and similar normalized text.
+Future semantic dedupe can broaden beyond a single source. It should compare only a small candidate set: same project, open statuses, recent `last_seen_at`, and similar normalized text.
 
 ## Growth Control
 

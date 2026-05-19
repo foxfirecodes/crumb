@@ -63,16 +63,16 @@ Override that with:
 CRUMB_ACP_AGENT_COMMAND="npx -y @agentclientprotocol/claude-agent-acp@0.33.1"
 ```
 
-or any other ACP-compatible agent command.
+or any other ACP-compatible agent command. Crumb passes ACP session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. It reuses normal Claude Code auth by default. Set `CRUMB_AI_MODEL=haiku` to use Haiku, `CRUMB_AI_EFFORT=medium` to trade speed for quality, or `CRUMB_CLAUDE_CONFIG_DIR=/path/to/config` if you want Crumb to use a completely separate Claude config/auth directory that has already been authenticated.
 
 ## /scrape Flow
 
 1. User runs `/scrape limit:N` in Discord.
 2. Discord delivers an `INTERACTION_CREATE` event over the bot gateway.
 3. Rust defers an ephemeral interaction reply.
-4. Rust inserts a running scrape row and emits `scrape:new`.
+4. Rust upserts a running Source row keyed by the Discord channel/thread and emits `scrape:new`.
 5. Rust calls `GET /channels/{channel_id}/messages` with the user token, paginating in batches of up to 100 messages.
-6. Rust formats the transcript chronologically and sends it to the ACP connector.
+6. Rust formats the transcript chronologically, includes existing source actions/decisions for reconciliation, and sends it to the ACP connector.
 7. The ACP response is parsed as JSON with:
 
 ```json

@@ -57,19 +57,9 @@ body {
   -webkit-app-region: drag;
 }
 
-.popover__heading {
-  min-width: 0;
-}
-
-.popover__title {
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
 .popover__tabs {
   display: inline-flex;
   gap: 2px;
-  margin-top: 5px;
   padding: 2px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--border);
