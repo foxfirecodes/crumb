@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ const DEFAULT_ACP_AGENT_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0
 const SYSTEM_PROMPT: &str = r#"You are an extraction and reconciliation specialist. You receive a chronological transcript of Discord messages from a single source plus existing records Crumb already knows about from that source. Your job is to identify:
 
 1. DECISIONS: concrete choices made during the conversation. A decision is something the group settled on, not a question or proposal.
-2. ACTION ITEMS: concrete things someone committed to do, with assignee and due date if mentioned.
+2. ACTION ITEMS: concrete things someone committed to do, with assignee, assignee_key, and due date if mentioned.
 3. A two-sentence SUMMARY of the conversation.
 
 Rules:
@@ -29,6 +30,9 @@ Rules:
 - Treat wording variations as duplicates when the owner, object, and outcome are substantially the same. Example: "provide partner user IDs for whitelisting" and "send Lew partner user IDs to add to the experiment" are the same task.
 - Deduplicate within this response too. Return one action item per real-world task and one decision per real-world decision.
 - For action item "text", produce a concise canonical title. If "merge_with" is set, prefer the existing title unless the new wording is clearly better.
+- You receive known_people_json with stable Discord user keys. If an action item's responsible party matches a known person by name, username, author, or @ mention, set "assignee_key" to that person's key and "assignee" to their display name.
+- If the responsible party is a team or group, set "assignee_key" to "team:" plus a stable lowercase slug. If it is an unknown individual, use "person:" plus a stable lowercase slug. Leave both assignee fields null only when no responsible party is stated.
+- For "due", preserve any explicit target date, target day, deadline, or timeframe from the source, including relative values like "today", "this week", or "next Friday". Leave it null only when no target date/timeframe is stated.
 - For decisions, quote the original wording in "context"; do not paraphrase the evidence.
 - "dedupe_key" must be stable across repeated scrapes. Use a short lowercase semantic key, not a hash and not a sentence copy.
 - For repeated evidence from the same Discord messages, reuse the same "message_ids".
@@ -42,7 +46,7 @@ Rules:
     { "text": "string", "context": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
   ],
   "action_items": [
-    { "text": "string", "assignee": "string", "due": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
+    { "text": "string", "assignee": "string", "assignee_key": "string", "due": "string", "message_ids": ["string"], "dedupe_key": "string", "merge_with": "string or null" }
   ]
 }"#;
 
@@ -64,7 +68,9 @@ pub struct ExtractedActionItem {
     pub text: String,
     #[serde(default)]
     pub assignee: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "assigneeKey")]
+    pub assignee_key: Option<String>,
+    #[serde(default, alias = "target_date", alias = "targetDate")]
     pub due: Option<String>,
     #[serde(default)]
     pub message_ids: Option<Vec<String>>,
@@ -266,9 +272,10 @@ fn build_prompt(
         .collect::<Vec<_>>();
     let existing_actions = serde_json::to_string(&existing_actions)?;
     let existing_decisions = serde_json::to_string(&existing_decisions)?;
+    let known_people = serde_json::to_string(&known_people_from_messages(messages))?;
 
     Ok(format!(
-        "{SYSTEM_PROMPT}\n\nAnalyze this Discord source transcript and extract decisions, action items, and a summary. Use the existing records to merge duplicates rather than creating new variants.\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript>\n{}\n</transcript>",
+        "{SYSTEM_PROMPT}\n\nAnalyze this Discord source transcript and extract decisions, action items, and a summary. Use the existing records to merge duplicates rather than creating new variants.\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript>\n{}\n</transcript>",
         format_transcript(messages)
     ))
 }
@@ -388,6 +395,7 @@ struct ExistingActionForPrompt<'a> {
     id: &'a str,
     title: &'a str,
     status: &'a str,
+    assignee_key: Option<&'a str>,
     assignee: Option<&'a str>,
     due: Option<&'a str>,
     latest_context: Option<&'a str>,
@@ -399,6 +407,7 @@ impl<'a> From<&'a CanonicalActionItem> for ExistingActionForPrompt<'a> {
             id: &item.id,
             title: &item.title,
             status: &item.status,
+            assignee_key: item.assignee_key.as_deref(),
             assignee: item.assignee.as_deref(),
             due: item.due.as_deref(),
             latest_context: item.latest_context.as_deref(),
@@ -426,6 +435,65 @@ impl<'a> From<&'a Decision> for ExistingDecisionForPrompt<'a> {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownPersonForPrompt {
+    key: String,
+    display_name: String,
+    username: String,
+    aliases: Vec<String>,
+}
+
+fn known_people_from_messages(messages: &[NormalizedMessage]) -> Vec<KnownPersonForPrompt> {
+    let mut people: BTreeMap<String, KnownPersonForPrompt> = BTreeMap::new();
+
+    for message in messages {
+        people.entry(message.author_key.clone()).or_insert_with(|| {
+            person_for_prompt(
+                &message.author_key,
+                &message.author,
+                &message.author_username,
+                None,
+            )
+        });
+
+        for mention in &message.mentions {
+            people.entry(mention.key.clone()).or_insert_with(|| {
+                person_for_prompt(
+                    &mention.key,
+                    &mention.display_name,
+                    &mention.username,
+                    Some(&mention.id),
+                )
+            });
+        }
+    }
+
+    people.into_values().collect()
+}
+
+fn person_for_prompt(
+    key: &str,
+    display_name: &str,
+    username: &str,
+    discord_id: Option<&str>,
+) -> KnownPersonForPrompt {
+    let mut aliases = vec![display_name.to_string(), username.to_string()];
+    if let Some(id) = discord_id {
+        aliases.push(format!("<@{id}>"));
+        aliases.push(format!("<@!{id}>"));
+    }
+    aliases.sort();
+    aliases.dedup();
+
+    KnownPersonForPrompt {
+        key: key.to_string(),
+        display_name: display_name.to_string(),
+        username: username.to_string(),
+        aliases,
+    }
+}
+
 fn format_transcript(messages: &[NormalizedMessage]) -> String {
     messages
         .iter()
@@ -441,8 +509,8 @@ fn format_transcript(messages: &[NormalizedMessage]) -> String {
                 format!(" [+{} attachment(s)]", m.attachments.len())
             };
             format!(
-                "[{}] [{}] <{}>{}{}: {}",
-                m.timestamp, m.id, m.author, reply, attachments, m.content
+                "[{}] [{}] <{} | {}>{}{}: {}",
+                m.timestamp, m.id, m.author, m.author_key, reply, attachments, m.content
             )
         })
         .collect::<Vec<_>>()

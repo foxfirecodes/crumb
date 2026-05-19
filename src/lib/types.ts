@@ -28,6 +28,7 @@ export interface ActionItem {
   id: string;
   scrapeId: string;
   text: string;
+  assigneeKey: string | null;
   assignee: string | null;
   due: string | null;
   messageIds: string[];
@@ -48,6 +49,7 @@ export interface CanonicalActionItem {
   sourceKind: "discord" | "asana" | "manual" | "mixed";
   sourceScope: string;
   sourceLabel: string | null;
+  assigneeKey: string | null;
   assignee: string | null;
   due: string | null;
   priority: number;
@@ -59,6 +61,8 @@ export interface CanonicalActionItem {
   latestContext: string | null;
   evidenceCount: number;
 }
+
+export type ActionItemStatusFilter = "open" | "dismissed" | "all";
 
 export interface ScrapeDetail {
   scrape: ScrapeSummary;

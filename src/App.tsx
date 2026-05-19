@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   getScrape,
   getSidecarStatus,
@@ -12,6 +12,7 @@ import {
 } from "./lib/ipc";
 import type {
   CanonicalActionItem,
+  ActionItemStatusFilter,
   ScrapeDetail,
   ScrapeSummary,
   SidecarStatus,
@@ -25,6 +26,9 @@ type View = "actions" | "sources";
 
 export default function App() {
   const [view, setView] = useState<View>("actions");
+  const [actionStatusFilter, setActionStatusFilter] =
+    useState<ActionItemStatusFilter>("open");
+  const [personFilter, setPersonFilter] = useState<string>("all");
   const [actions, setActions] = useState<CanonicalActionItem[]>([]);
   const [scrapes, setScrapes] = useState<ScrapeSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -32,7 +36,7 @@ export default function App() {
   const [status, setStatus] = useState<SidecarStatus>({ kind: "starting" });
 
   useEffect(() => {
-    listActionItems().then(setActions).catch(console.error);
+    listActionItems(actionStatusFilter).then(setActions).catch(console.error);
     listScrapes().then(setScrapes).catch(console.error);
     getSidecarStatus().then(setStatus).catch(console.error);
 
@@ -44,9 +48,11 @@ export default function App() {
       setDetail((prev) =>
         prev && prev.scrape.id === s.id ? { ...prev, scrape: s } : prev,
       );
-      listActionItems().then(setActions).catch(console.error);
+      listActionItems(actionStatusFilter).then(setActions).catch(console.error);
     });
-    const unlistenActions = onActionsUpdated(setActions);
+    const unlistenActions = onActionsUpdated(() => {
+      listActionItems(actionStatusFilter).then(setActions).catch(console.error);
+    });
     const unlistenStatus = onSidecarStatus(setStatus);
 
     return () => {
@@ -55,7 +61,7 @@ export default function App() {
       unlistenActions.then((fn) => fn());
       unlistenStatus.then((fn) => fn());
     };
-  }, []);
+  }, [actionStatusFilter]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -65,9 +71,48 @@ export default function App() {
     getScrape(selectedId).then(setDetail).catch(console.error);
   }, [selectedId, scrapes]);
 
-  const markDone = (id: string) => {
+  const personOptions = useMemo(() => {
+    const people = new Map<string, { key: string; label: string; count: number }>();
+    for (const action of actions) {
+      const key = assigneeFilterKey(action);
+      if (!key || !action.assignee) continue;
+      const existing = people.get(key);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        people.set(key, { key, label: action.assignee, count: 1 });
+      }
+    }
+    return [...people.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }, [actions]);
+
+  useEffect(() => {
+    if (
+      personFilter !== "all" &&
+      !personOptions.some((person) => person.key === personFilter)
+    ) {
+      setPersonFilter("all");
+    }
+  }, [personFilter, personOptions]);
+
+  const filteredActions =
+    personFilter === "all"
+      ? actions
+      : actions.filter((action) => assigneeFilterKey(action) === personFilter);
+
+  const refreshActions = () => {
+    listActionItems(actionStatusFilter).then(setActions).catch(console.error);
+  };
+
+  const dismissAction = (id: string) => {
     setActionItemStatus(id, "done")
-      .then(() => listActionItems().then(setActions))
+      .then(refreshActions)
+      .catch(console.error);
+  };
+
+  const restoreAction = (id: string) => {
+    setActionItemStatus(id, "inbox")
+      .then(refreshActions)
       .catch(console.error);
   };
 
@@ -96,7 +141,16 @@ export default function App() {
 
       <main className="popover__body">
         {view === "actions" ? (
-          <ActionList actions={actions} onDone={markDone} />
+          <ActionList
+            actions={filteredActions}
+            statusFilter={actionStatusFilter}
+            personFilter={personFilter}
+            personOptions={personOptions}
+            onStatusFilterChange={setActionStatusFilter}
+            onPersonFilterChange={setPersonFilter}
+            onDismiss={dismissAction}
+            onRestore={restoreAction}
+          />
         ) : selectedId && detail ? (
           <ScrapeDetailView
             detail={detail}
@@ -109,3 +163,13 @@ export default function App() {
     </div>
   );
 }
+
+const assigneeFilterKey = (item: CanonicalActionItem) => {
+  if (item.assigneeKey) return item.assigneeKey;
+  if (!item.assignee) return null;
+  const normalized = item.assignee
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  return normalized ? `person:${normalized}` : null;
+};

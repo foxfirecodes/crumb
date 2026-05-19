@@ -32,6 +32,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0002_action_item_dedupe.sql"),
         prepare: Some(prepare_action_item_dedupe_migration),
     },
+    Migration {
+        id: "0003_assignee_keys",
+        sql: include_str!("../migrations/0003_assignee_keys.sql"),
+        prepare: Some(prepare_assignee_keys_migration),
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -46,6 +51,7 @@ pub struct DecisionCandidate {
 #[derive(Debug, Clone)]
 pub struct ActionCandidate {
     pub text: String,
+    pub assignee_key: Option<String>,
     pub assignee: Option<String>,
     pub due: Option<String>,
     pub message_ids: Vec<String>,
@@ -93,30 +99,53 @@ impl Db {
         Ok(result)
     }
 
-    pub fn list_open_action_items(&self) -> Result<Vec<CanonicalActionItem>> {
+    pub fn list_action_items(&self, status_filter: &str) -> Result<Vec<CanonicalActionItem>> {
+        let status_clause = match status_filter {
+            "open" => {
+                "a.status IN ('inbox', 'active')
+                 AND (a.snoozed_until IS NULL OR a.snoozed_until <= strftime('%s','now') * 1000)"
+            }
+            "dismissed" => "a.status IN ('done', 'archived')",
+            "all" => {
+                "(a.status IN ('inbox', 'active', 'done', 'archived')
+                  OR (a.status = 'snoozed'
+                      AND (a.snoozed_until IS NULL OR a.snoozed_until <= strftime('%s','now') * 1000)))"
+            }
+            other => bail!("invalid action item status filter: {other}"),
+        };
+        let order_clause = match status_filter {
+            "dismissed" => "COALESCE(a.completed_at, a.last_seen_at) DESC, a.last_seen_at DESC",
+            _ => {
+                "CASE WHEN a.due IS NULL OR a.due = '' THEN 1 ELSE 0 END,
+                 a.due,
+                 a.priority DESC,
+                 a.relevance_score DESC,
+                 a.last_seen_at DESC"
+            }
+        };
+
         let conn = self.inner.lock();
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT a.id, a.title, a.status, a.source_kind, a.source_scope, a.source_label,
-                    a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
+                    a.assignee_key, a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
                     a.last_seen_at, a.completed_at, a.snoozed_until, a.latest_context,
                     COUNT(e.id) AS evidence_count
              FROM canonical_action_items a
              LEFT JOIN action_item_evidence e ON e.action_item_id = a.id
-             WHERE a.status IN ('inbox', 'active')
-               AND (a.snoozed_until IS NULL OR a.snoozed_until <= strftime('%s','now') * 1000)
+             WHERE {status_clause}
              GROUP BY a.id
-             ORDER BY
-               CASE WHEN a.due IS NULL OR a.due = '' THEN 1 ELSE 0 END,
-               a.due,
-               a.priority DESC,
-               a.relevance_score DESC,
-               a.last_seen_at DESC
-             LIMIT 50",
-        )?;
+             ORDER BY {order_clause}
+             LIMIT 100"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let result = stmt
             .query_map([], row_to_canonical_action)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(result)
+    }
+
+    pub fn list_open_action_items(&self) -> Result<Vec<CanonicalActionItem>> {
+        self.list_action_items("open")
     }
 
     pub fn set_action_status(&self, id: &str, status: &str) -> Result<CanonicalActionItem> {
@@ -173,7 +202,7 @@ impl Db {
 
         let action_items: Vec<_> = {
             let mut stmt = conn.prepare(
-                "SELECT id, scrape_id, text, assignee, due, message_ids, created_at
+                "SELECT id, scrape_id, text, assignee_key, assignee, due, message_ids, created_at
                  FROM action_items WHERE scrape_id = ? ORDER BY created_at",
             )?;
             let collected = stmt
@@ -197,7 +226,7 @@ impl Db {
         let conn = self.inner.lock();
         let mut stmt = conn.prepare(
             "SELECT a.id, a.title, a.status, a.source_kind, a.source_scope, a.source_label,
-                    a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
+                    a.assignee_key, a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
                     a.last_seen_at, a.completed_at, a.snoozed_until, a.latest_context,
                     COUNT(e.id) AS evidence_count
              FROM canonical_action_items a
@@ -346,6 +375,8 @@ impl Db {
         }
         for action in action_items {
             let ids = serde_json::to_string(&action.message_ids)?;
+            let assignee_key =
+                stable_assignee_key(action.assignee_key.as_deref(), action.assignee.as_deref());
             let canonical_id = upsert_canonical_action(
                 &tx,
                 now,
@@ -354,6 +385,7 @@ impl Db {
                 &source_label,
                 scrape_id,
                 &action.text,
+                assignee_key.as_deref(),
                 action.assignee.as_deref(),
                 action.due.as_deref(),
                 action.dedupe_key.as_deref(),
@@ -362,10 +394,11 @@ impl Db {
             )?;
             let item_key = format!("canonical:{canonical_id}");
             tx.execute(
-                "INSERT INTO action_items (id, scrape_id, text, assignee, due, message_ids, created_at, dedupe_key)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO action_items (id, scrape_id, text, assignee_key, assignee, due, message_ids, created_at, dedupe_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(scrape_id, dedupe_key) DO UPDATE SET
                    text = excluded.text,
+                   assignee_key = COALESCE(excluded.assignee_key, action_items.assignee_key),
                    assignee = COALESCE(excluded.assignee, action_items.assignee),
                    due = COALESCE(excluded.due, action_items.due),
                    message_ids = excluded.message_ids",
@@ -373,6 +406,7 @@ impl Db {
                     uuid::Uuid::new_v4().to_string(),
                     scrape_id,
                     action.text.as_str(),
+                    assignee_key.as_deref(),
                     action.assignee.as_deref(),
                     action.due.as_deref(),
                     ids,
@@ -407,7 +441,7 @@ impl Db {
         let action = conn
             .query_row(
                 "SELECT a.id, a.title, a.status, a.source_kind, a.source_scope, a.source_label,
-                        a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
+                        a.assignee_key, a.assignee, a.due, a.priority, a.relevance_score, a.first_seen_at,
                         a.last_seen_at, a.completed_at, a.snoozed_until, a.latest_context,
                         COUNT(e.id) AS evidence_count
                  FROM canonical_action_items a
@@ -477,6 +511,40 @@ fn prepare_action_item_dedupe_migration(conn: &rusqlite::Connection) -> Result<(
     ensure_column(conn, "action_items", "dedupe_key", "TEXT")?;
     dedupe_source_rows(conn, "decisions")?;
     dedupe_source_rows(conn, "action_items")?;
+    Ok(())
+}
+
+fn prepare_assignee_keys_migration(conn: &rusqlite::Connection) -> Result<()> {
+    ensure_column(conn, "action_items", "assignee_key", "TEXT")?;
+    ensure_column(conn, "canonical_action_items", "assignee_key", "TEXT")?;
+    backfill_assignee_keys(conn, "action_items")?;
+    backfill_assignee_keys(conn, "canonical_action_items")?;
+    Ok(())
+}
+
+fn backfill_assignee_keys(conn: &rusqlite::Connection, table: &str) -> Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, assignee FROM {table}
+             WHERE assignee_key IS NULL AND assignee IS NOT NULL AND trim(assignee) != ''"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    for (id, assignee) in rows {
+        if let Some(assignee_key) = stable_assignee_key(None, Some(&assignee)) {
+            conn.execute(
+                &format!("UPDATE {table} SET assignee_key = ? WHERE id = ?"),
+                rusqlite::params![assignee_key, id],
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -575,7 +643,7 @@ fn row_to_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
 }
 
 fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionItem> {
-    let raw_ids: Option<String> = row.get(5)?;
+    let raw_ids: Option<String> = row.get(6)?;
     let message_ids: Vec<String> = raw_ids
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -584,10 +652,11 @@ fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionItem> {
         id: row.get(0)?,
         scrape_id: row.get(1)?,
         text: row.get(2)?,
-        assignee: row.get(3)?,
-        due: row.get(4)?,
+        assignee_key: row.get(3)?,
+        assignee: row.get(4)?,
+        due: row.get(5)?,
         message_ids,
-        created_at: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -599,16 +668,17 @@ fn row_to_canonical_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<Canonica
         source_kind: row.get(3)?,
         source_scope: row.get(4)?,
         source_label: row.get(5)?,
-        assignee: row.get(6)?,
-        due: row.get(7)?,
-        priority: row.get(8)?,
-        relevance_score: row.get(9)?,
-        first_seen_at: row.get(10)?,
-        last_seen_at: row.get(11)?,
-        completed_at: row.get(12)?,
-        snoozed_until: row.get(13)?,
-        latest_context: row.get(14)?,
-        evidence_count: row.get(15)?,
+        assignee_key: row.get(6)?,
+        assignee: row.get(7)?,
+        due: row.get(8)?,
+        priority: row.get(9)?,
+        relevance_score: row.get(10)?,
+        first_seen_at: row.get(11)?,
+        last_seen_at: row.get(12)?,
+        completed_at: row.get(13)?,
+        snoozed_until: row.get(14)?,
+        latest_context: row.get(15)?,
+        evidence_count: row.get(16)?,
     })
 }
 
@@ -620,6 +690,7 @@ fn upsert_canonical_action(
     source_label: &str,
     scrape_id: &str,
     text: &str,
+    assignee_key: Option<&str>,
     assignee: Option<&str>,
     due: Option<&str>,
     ai_dedupe_key: Option<&str>,
@@ -627,7 +698,16 @@ fn upsert_canonical_action(
     message_ids: &[String],
 ) -> Result<String> {
     if let Some(action_id) = valid_merge_target(tx, source_kind, source_scope, merge_with)? {
-        update_canonical_action(tx, &action_id, now, source_label, text, assignee, due)?;
+        update_canonical_action(
+            tx,
+            &action_id,
+            now,
+            source_label,
+            text,
+            assignee_key,
+            assignee,
+            due,
+        )?;
         insert_action_evidence(
             tx,
             now,
@@ -643,7 +723,16 @@ fn upsert_canonical_action(
     }
 
     if let Some(action_id) = find_similar_action_id(tx, source_kind, source_scope, text)? {
-        update_canonical_action(tx, &action_id, now, source_label, text, assignee, due)?;
+        update_canonical_action(
+            tx,
+            &action_id,
+            now,
+            source_label,
+            text,
+            assignee_key,
+            assignee,
+            due,
+        )?;
         insert_action_evidence(
             tx,
             now,
@@ -666,13 +755,14 @@ fn upsert_canonical_action(
     tx.execute(
         "INSERT INTO canonical_action_items (
            id, title, status, source_kind, source_scope, source_label, dedupe_key,
-           assignee, due, priority, relevance_score, first_seen_at, last_seen_at, latest_context
+           assignee_key, assignee, due, priority, relevance_score, first_seen_at, last_seen_at, latest_context
          )
-         VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+         VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
          ON CONFLICT(source_kind, source_scope, dedupe_key) DO UPDATE SET
            last_seen_at = excluded.last_seen_at,
            source_label = excluded.source_label,
            latest_context = excluded.latest_context,
+           assignee_key = COALESCE(canonical_action_items.assignee_key, excluded.assignee_key),
            assignee = COALESCE(canonical_action_items.assignee, excluded.assignee),
            due = COALESCE(canonical_action_items.due, excluded.due),
            title = CASE
@@ -687,6 +777,7 @@ fn upsert_canonical_action(
             source_scope,
             source_label,
             dedupe_key,
+            assignee_key,
             assignee,
             due,
             now,
@@ -723,6 +814,7 @@ fn update_canonical_action(
     now: i64,
     source_label: &str,
     text: &str,
+    assignee_key: Option<&str>,
     assignee: Option<&str>,
     due: Option<&str>,
 ) -> Result<()> {
@@ -731,6 +823,7 @@ fn update_canonical_action(
          SET last_seen_at = ?,
              source_label = ?,
              latest_context = ?,
+             assignee_key = COALESCE(canonical_action_items.assignee_key, ?),
              assignee = COALESCE(canonical_action_items.assignee, ?),
              due = COALESCE(canonical_action_items.due, ?),
              title = CASE
@@ -743,6 +836,7 @@ fn update_canonical_action(
             now,
             source_label,
             text,
+            assignee_key,
             assignee,
             due,
             text,
@@ -1007,6 +1101,47 @@ fn normalize_key(text: &str) -> String {
     trimmed.to_string()
 }
 
+fn stable_assignee_key(extracted_key: Option<&str>, assignee: Option<&str>) -> Option<String> {
+    extracted_key
+        .and_then(normalize_assignee_key)
+        .or_else(|| assignee.and_then(assignee_key_from_label))
+}
+
+fn normalize_assignee_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lowered = trimmed.to_lowercase();
+    let mut normalized = String::with_capacity(lowered.len());
+    let mut last_was_separator = false;
+
+    for ch in lowered.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '.') {
+            normalized.push(ch);
+            last_was_separator = false;
+        } else if ch.is_whitespace() || matches!(ch, '-' | '/' | ',' | ';') {
+            if !last_was_separator {
+                normalized.push('-');
+                last_was_separator = true;
+            }
+        }
+    }
+
+    let normalized = normalized.trim_matches('-').to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn assignee_key_from_label(label: &str) -> Option<String> {
+    let normalized = normalize_key(label).replace(' ', "-");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("person:{normalized}"))
+    }
+}
+
 fn decision_item_key(
     ai_dedupe_key: Option<&str>,
     merge_with: Option<&str>,
@@ -1158,6 +1293,7 @@ mod tests {
             }],
             &[ActionCandidate {
                 text: "Verify old Crumb databases migrate at startup".into(),
+                assignee_key: None,
                 assignee: None,
                 due: None,
                 message_ids: vec!["message-2".into()],
@@ -1173,7 +1309,10 @@ mod tests {
         drop(db);
         let conn = rusqlite::Connection::open(&db_path)?;
         let applied = applied_migrations(&conn)?;
-        assert_eq!(applied, vec!["0001_init", "0002_action_item_dedupe"]);
+        assert_eq!(
+            applied,
+            vec!["0001_init", "0002_action_item_dedupe", "0003_assignee_keys"]
+        );
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
@@ -1246,7 +1385,10 @@ mod tests {
         drop(db);
         let conn = rusqlite::Connection::open(&db_path)?;
         let applied = applied_migrations(&conn)?;
-        assert_eq!(applied, vec!["0001_init", "0002_action_item_dedupe"]);
+        assert_eq!(
+            applied,
+            vec!["0001_init", "0002_action_item_dedupe", "0003_assignee_keys"]
+        );
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
@@ -1272,6 +1414,7 @@ mod tests {
             &[],
             &[ActionCandidate {
                 text: "Need to ship the menu bar UX".into(),
+                assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: None,
                 message_ids: vec!["message-1".into()],
@@ -1295,6 +1438,7 @@ mod tests {
             &[],
             &[ActionCandidate {
                 text: "Ship the menu bar UX".into(),
+                assignee_key: Some("discord:user:fox".into()),
                 assignee: Some("fox".into()),
                 due: None,
                 message_ids: vec!["message-1".into()],
@@ -1306,6 +1450,49 @@ mod tests {
         let actions = db.list_open_action_items()?;
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].evidence_count, 1);
+        assert_eq!(actions[0].assignee_key.as_deref(), Some("discord:user:fox"));
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn dismissed_actions_can_be_listed_and_restored() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-action-status-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "scrape-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "scrape-1",
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Send launch checklist".into(),
+                assignee_key: Some("discord:user:fox".into()),
+                assignee: Some("fox".into()),
+                due: Some("Friday".into()),
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("send-launch-checklist".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let action_id = db.list_open_action_items()?[0].id.clone();
+        db.set_action_status(&action_id, "done")?;
+        assert!(db.list_open_action_items()?.is_empty());
+        assert_eq!(db.list_action_items("dismissed")?.len(), 1);
+
+        db.set_action_status(&action_id, "inbox")?;
+        assert_eq!(db.list_open_action_items()?.len(), 1);
+        assert!(db.list_action_items("dismissed")?.is_empty());
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
@@ -1337,6 +1524,7 @@ mod tests {
             }],
             &[ActionCandidate {
                 text: "Provide Lew with partner user IDs for experiment whitelisting".into(),
+                assignee_key: Some("discord:user:arthur".into()),
                 assignee: Some("Arthur Tang".into()),
                 due: Some("this week".into()),
                 message_ids: vec!["message-2".into()],
@@ -1367,6 +1555,7 @@ mod tests {
             &[
                 ActionCandidate {
                     text: "Provide Lew with the partner user IDs and application IDs to add to the experiment.".into(),
+                    assignee_key: Some("discord:user:arthur".into()),
                     assignee: Some("Arthur Tang".into()),
                     due: Some("this week".into()),
                     message_ids: vec!["message-2".into()],
@@ -1375,6 +1564,7 @@ mod tests {
                 },
                 ActionCandidate {
                     text: "Add screenshots to partner docs".into(),
+                    assignee_key: Some("discord:user:anthony".into()),
                     assignee: Some("Anthony".into()),
                     due: Some("today".into()),
                     message_ids: vec!["message-3".into()],

@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   CanonicalActionItem,
   CanonicalActionStatus,
+  ActionItemStatusFilter,
   ScrapeDetail,
   ScrapeSummary,
   SidecarStatus,
@@ -11,8 +12,8 @@ import type {
 export const listScrapes = () => invoke<ScrapeSummary[]>("list_scrapes");
 export const getScrape = (id: string) =>
   invoke<ScrapeDetail | null>("get_scrape", { id });
-export const listActionItems = () =>
-  invoke<CanonicalActionItem[]>("list_action_items");
+export const listActionItems = (statusFilter: ActionItemStatusFilter) =>
+  invoke<CanonicalActionItem[]>("list_action_items", { statusFilter });
 export const setActionItemStatus = (
   id: string,
   status: CanonicalActionStatus,

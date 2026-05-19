@@ -14,13 +14,24 @@ const DISCORD_GATEWAY: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const USER_AGENT_VALUE: &str = "Crumb/0.1";
 
 #[derive(Debug, Clone)]
+pub struct NormalizedPerson {
+    pub id: String,
+    pub key: String,
+    pub display_name: String,
+    pub username: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct NormalizedMessage {
     pub id: String,
     pub author: String,
+    pub author_key: String,
+    pub author_username: String,
     pub content: String,
     pub timestamp: String,
     pub reply_to_id: Option<String>,
     pub attachments: Vec<String>,
+    pub mentions: Vec<NormalizedPerson>,
 }
 
 #[derive(Debug)]
@@ -533,6 +544,8 @@ struct ApiMessage {
     message_reference: Option<MessageReference>,
     #[serde(default)]
     attachments: Vec<ApiAttachment>,
+    #[serde(default)]
+    mentions: Vec<ApiUser>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,14 +561,27 @@ struct ApiAttachment {
 
 impl From<ApiMessage> for NormalizedMessage {
     fn from(value: ApiMessage) -> Self {
+        let author = normalize_person(&value.author);
         Self {
             id: value.id,
-            author: format_user_tag(&value.author),
+            author: author.display_name,
+            author_key: author.key,
+            author_username: author.username,
             content: value.content.unwrap_or_default(),
             timestamp: value.timestamp,
             reply_to_id: value.message_reference.and_then(|r| r.message_id),
             attachments: value.attachments.into_iter().map(|a| a.url).collect(),
+            mentions: value.mentions.iter().map(normalize_person).collect(),
         }
+    }
+}
+
+fn normalize_person(user: &ApiUser) -> NormalizedPerson {
+    NormalizedPerson {
+        id: user.id.clone(),
+        key: format!("discord:user:{}", user.id),
+        display_name: format_user_tag(user),
+        username: user.username.clone(),
     }
 }
 

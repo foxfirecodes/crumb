@@ -44,6 +44,8 @@ pub struct ActionItem {
     #[serde(rename = "scrapeId")]
     pub scrape_id: String,
     pub text: String,
+    #[serde(rename = "assigneeKey")]
+    pub assignee_key: Option<String>,
     pub assignee: Option<String>,
     pub due: Option<String>,
     #[serde(rename = "messageIds")]
@@ -63,6 +65,8 @@ pub struct CanonicalActionItem {
     pub source_scope: String,
     #[serde(rename = "sourceLabel")]
     pub source_label: Option<String>,
+    #[serde(rename = "assigneeKey")]
+    pub assignee_key: Option<String>,
     pub assignee: Option<String>,
     pub due: Option<String>,
     pub priority: i64,

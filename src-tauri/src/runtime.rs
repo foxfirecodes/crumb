@@ -222,6 +222,7 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
                 .map(|a| ActionCandidate {
                     text: a.text,
                     assignee: a.assignee,
+                    assignee_key: a.assignee_key,
                     due: a.due,
                     message_ids: a.message_ids.unwrap_or_default(),
                     dedupe_key: a.dedupe_key,

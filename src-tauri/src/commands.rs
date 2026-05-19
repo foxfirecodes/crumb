@@ -17,8 +17,12 @@ pub fn get_scrape(id: String, db: State<'_, Db>) -> Result<Option<ScrapeDetail>,
 }
 
 #[tauri::command]
-pub fn list_action_items(db: State<'_, Db>) -> Result<Vec<CanonicalActionItem>, String> {
-    db.list_open_action_items().map_err(|e| e.to_string())
+pub fn list_action_items(
+    status_filter: String,
+    db: State<'_, Db>,
+) -> Result<Vec<CanonicalActionItem>, String> {
+    db.list_action_items(&status_filter)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
