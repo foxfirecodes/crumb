@@ -12,6 +12,8 @@ import type {
 export const listScrapes = () => invoke<ScrapeSummary[]>("list_scrapes");
 export const getScrape = (id: string) =>
   invoke<ScrapeDetail | null>("get_scrape", { id });
+export const deleteSource = (id: string) =>
+  invoke<void>("delete_source", { id });
 export const listActionItems = (statusFilter: ActionItemStatusFilter) =>
   invoke<CanonicalActionItem[]>("list_action_items", { statusFilter });
 export const setActionItemStatus = (

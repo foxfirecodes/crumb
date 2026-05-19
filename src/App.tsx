@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  deleteSource,
   getScrape,
   getSidecarStatus,
   listActionItems,
@@ -23,17 +24,26 @@ import { StatusDot } from "./components/StatusDot";
 import { ActionList } from "./components/ActionList";
 
 type View = "actions" | "sources";
+const PERSON_FILTER_STORAGE_KEY = "crumb.personFilter";
+
+interface StoredPersonFilter {
+  key: string;
+  label: string | null;
+}
 
 export default function App() {
   const [view, setView] = useState<View>("actions");
   const [actionStatusFilter, setActionStatusFilter] =
     useState<ActionItemStatusFilter>("open");
-  const [personFilter, setPersonFilter] = useState<string>("all");
+  const [storedPersonFilter, setStoredPersonFilter] =
+    useState<StoredPersonFilter>(readStoredPersonFilter);
   const [actions, setActions] = useState<CanonicalActionItem[]>([]);
   const [scrapes, setScrapes] = useState<ScrapeSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ScrapeDetail | null>(null);
   const [status, setStatus] = useState<SidecarStatus>({ kind: "starting" });
+  const personFilter = storedPersonFilter.key;
 
   useEffect(() => {
     listActionItems(actionStatusFilter).then(setActions).catch(console.error);
@@ -83,17 +93,21 @@ export default function App() {
         people.set(key, { key, label: action.assignee, count: 1 });
       }
     }
-    return [...people.values()].sort((a, b) => a.label.localeCompare(b.label));
-  }, [actions]);
-
-  useEffect(() => {
+    const options = [...people.values()].sort((a, b) =>
+      a.label.localeCompare(b.label),
+    );
     if (
-      personFilter !== "all" &&
-      !personOptions.some((person) => person.key === personFilter)
+      storedPersonFilter.key !== "all" &&
+      !options.some((person) => person.key === storedPersonFilter.key)
     ) {
-      setPersonFilter("all");
+      options.unshift({
+        key: storedPersonFilter.key,
+        label: storedPersonFilter.label ?? storedPersonFilter.key,
+        count: 0,
+      });
     }
-  }, [personFilter, personOptions]);
+    return options;
+  }, [actions, storedPersonFilter]);
 
   const filteredActions =
     personFilter === "all"
@@ -102,6 +116,22 @@ export default function App() {
 
   const refreshActions = () => {
     listActionItems(actionStatusFilter).then(setActions).catch(console.error);
+  };
+
+  const refreshScrapes = () => {
+    listScrapes().then(setScrapes).catch(console.error);
+  };
+
+  const changePersonFilter = (key: string) => {
+    const next: StoredPersonFilter = {
+      key,
+      label:
+        key === "all"
+          ? null
+          : personOptions.find((person) => person.key === key)?.label ?? key,
+    };
+    setStoredPersonFilter(next);
+    writeStoredPersonFilter(next);
   };
 
   const dismissAction = (id: string) => {
@@ -114,6 +144,29 @@ export default function App() {
     setActionItemStatus(id, "inbox")
       .then(refreshActions)
       .catch(console.error);
+  };
+
+  const removeSource = (id: string) => {
+    if (pendingDeleteId !== id) {
+      setPendingDeleteId(id);
+      return;
+    }
+
+    deleteSource(id)
+      .then(() => {
+        setPendingDeleteId(null);
+        setSelectedId((current) => (current === id ? null : current));
+        setDetail((current) =>
+          current && current.scrape.id === id ? null : current,
+        );
+        setScrapes((current) => current.filter((scrape) => scrape.id !== id));
+        refreshScrapes();
+        refreshActions();
+      })
+      .catch((error) => {
+        setPendingDeleteId(null);
+        console.error(error);
+      });
   };
 
   return (
@@ -147,17 +200,24 @@ export default function App() {
             personFilter={personFilter}
             personOptions={personOptions}
             onStatusFilterChange={setActionStatusFilter}
-            onPersonFilterChange={setPersonFilter}
+            onPersonFilterChange={changePersonFilter}
             onDismiss={dismissAction}
             onRestore={restoreAction}
           />
         ) : selectedId && detail ? (
           <ScrapeDetailView
             detail={detail}
+            pendingDeleteId={pendingDeleteId}
             onBack={() => setSelectedId(null)}
+            onDelete={removeSource}
           />
         ) : (
-          <ScrapeList scrapes={scrapes} onSelect={setSelectedId} />
+          <ScrapeList
+            scrapes={scrapes}
+            pendingDeleteId={pendingDeleteId}
+            onSelect={setSelectedId}
+            onDelete={removeSource}
+          />
         )}
       </main>
     </div>
@@ -172,4 +232,32 @@ const assigneeFilterKey = (item: CanonicalActionItem) => {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
   return normalized ? `person:${normalized}` : null;
+};
+
+const readStoredPersonFilter = (): StoredPersonFilter => {
+  try {
+    const raw = window.localStorage.getItem(PERSON_FILTER_STORAGE_KEY);
+    if (!raw) return { key: "all", label: null };
+    const parsed = JSON.parse(raw) as Partial<StoredPersonFilter>;
+    if (!parsed.key || typeof parsed.key !== "string") {
+      return { key: "all", label: null };
+    }
+    return {
+      key: parsed.key,
+      label: typeof parsed.label === "string" ? parsed.label : null,
+    };
+  } catch {
+    return { key: "all", label: null };
+  }
+};
+
+const writeStoredPersonFilter = (filter: StoredPersonFilter) => {
+  try {
+    window.localStorage.setItem(
+      PERSON_FILTER_STORAGE_KEY,
+      JSON.stringify(filter),
+    );
+  } catch {
+    // Local storage may be unavailable in some webview modes.
+  }
 };

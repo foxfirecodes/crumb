@@ -32,6 +32,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_scrapes,
             commands::get_scrape,
+            commands::delete_source,
             commands::list_action_items,
             commands::set_action_item_status,
             commands::get_sidecar_status,

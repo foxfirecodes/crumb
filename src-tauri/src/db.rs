@@ -218,6 +218,36 @@ impl Db {
         }))
     }
 
+    pub fn delete_source(&self, id: &str) -> Result<()> {
+        let mut conn = self.inner.lock();
+        let tx = conn.transaction()?;
+        let source: Option<(String, String)> = tx
+            .query_row(
+                "SELECT source, channel_id FROM scrapes WHERE id = ?",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        let Some((source_kind, source_scope)) = source else {
+            tx.commit()?;
+            return Ok(());
+        };
+
+        tx.execute(
+            "DELETE FROM canonical_action_items
+             WHERE source_kind = ? AND source_scope = ?",
+            rusqlite::params![source_kind, source_scope],
+        )?;
+        tx.execute(
+            "DELETE FROM scrapes
+             WHERE source = ? AND channel_id = ?",
+            rusqlite::params![source_kind, source_scope],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn list_source_actions(
         &self,
         source_kind: &str,
@@ -1493,6 +1523,48 @@ mod tests {
         db.set_action_status(&action_id, "inbox")?;
         assert_eq!(db.list_open_action_items()?.len(), 1);
         assert!(db.list_action_items("dismissed")?.is_empty());
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_source_removes_its_actions() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-delete-source-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Retest source scraping".into(),
+                assignee_key: Some("discord:user:fox".into()),
+                assignee: Some("fox".into()),
+                due: Some("today".into()),
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("retest-source-scraping".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        assert_eq!(db.list_scrapes()?.len(), 1);
+        assert_eq!(db.list_open_action_items()?.len(), 1);
+
+        db.delete_source("discord:channel-1")?;
+
+        assert!(db.list_scrapes()?.is_empty());
+        assert!(db.get_scrape("discord:channel-1")?.is_none());
+        assert!(db.list_action_items("all")?.is_empty());
 
         let _ = std::fs::remove_file(db_path);
         Ok(())

@@ -17,6 +17,15 @@ pub fn get_scrape(id: String, db: State<'_, Db>) -> Result<Option<ScrapeDetail>,
 }
 
 #[tauri::command]
+pub fn delete_source(id: String, app: AppHandle, db: State<'_, Db>) -> Result<(), String> {
+    db.delete_source(&id).map_err(|e| e.to_string())?;
+    if let Ok(items) = db.list_open_action_items() {
+        let _ = app.emit("actions:updated", &items);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn list_action_items(
     status_filter: String,
     db: State<'_, Db>,

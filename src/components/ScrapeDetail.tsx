@@ -2,17 +2,37 @@ import type { ScrapeDetail } from "../lib/types";
 
 interface Props {
   detail: ScrapeDetail;
+  pendingDeleteId: string | null;
   onBack: () => void;
+  onDelete: (id: string) => void;
 }
 
-export function ScrapeDetailView({ detail, onBack }: Props) {
+export function ScrapeDetailView({
+  detail,
+  pendingDeleteId,
+  onBack,
+  onDelete,
+}: Props) {
   const { scrape, decisions, actionItems } = detail;
+  const isConfirmingDelete = pendingDeleteId === scrape.id;
 
   return (
     <div className="detail">
-      <button className="detail__back" onClick={onBack}>
-        ← back
-      </button>
+      <div className="detail__toolbar">
+        <button className="detail__back" onClick={onBack}>
+          ← back
+        </button>
+        <button
+          className={
+            isConfirmingDelete
+              ? "detail__delete detail__delete--confirm"
+              : "detail__delete"
+          }
+          onClick={() => onDelete(scrape.id)}
+        >
+          {isConfirmingDelete ? "Confirm delete" : "Delete source"}
+        </button>
+      </div>
 
       <h2 className="detail__title">
         {scrape.guildName ? `${scrape.guildName} · ` : ""}

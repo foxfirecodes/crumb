@@ -2,7 +2,9 @@ import type { ScrapeSummary } from "../lib/types";
 
 interface Props {
   scrapes: ScrapeSummary[];
+  pendingDeleteId: string | null;
   onSelect: (id: string) => void;
+  onDelete: (id: string) => void;
 }
 
 const formatTime = (ts: number) => {
@@ -21,7 +23,12 @@ const STATUS_GLYPH: Record<ScrapeSummary["status"], string> = {
   failed: "✕",
 };
 
-export function ScrapeList({ scrapes, onSelect }: Props) {
+export function ScrapeList({
+  scrapes,
+  pendingDeleteId,
+  onSelect,
+  onDelete,
+}: Props) {
   if (scrapes.length === 0) {
     return (
       <div className="empty">
@@ -50,6 +57,21 @@ export function ScrapeList({ scrapes, onSelect }: Props) {
               {s.channelName ?? s.channelId}
             </span>
             <span className="scrape-list__time">{formatTime(s.triggeredAt)}</span>
+            <button
+              className={
+                pendingDeleteId === s.id
+                  ? "scrape-list__delete scrape-list__delete--confirm"
+                  : "scrape-list__delete"
+              }
+              title={pendingDeleteId === s.id ? "Confirm delete" : "Delete source"}
+              aria-label={`Delete source ${s.channelName ?? s.channelId}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                onDelete(s.id);
+              }}
+            >
+              {pendingDeleteId === s.id ? "Confirm" : "Delete"}
+            </button>
           </div>
           {s.summary && (
             <div className="scrape-list__summary">{s.summary}</div>
