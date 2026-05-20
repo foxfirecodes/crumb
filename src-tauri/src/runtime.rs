@@ -780,12 +780,13 @@ fn pr_merge_outcomes(messages: &[NormalizedMessage]) -> BTreeMap<String, PrMerge
         let Some(url) = find_pr_url_in_message(message) else {
             continue;
         };
-        let text = notification_text(message);
+        let text = pr_outcome_text(message);
         let outcome: &mut PrMergeOutcome = outcomes.entry(url).or_default();
-        if is_pr_merge_success_notification(&text) {
+        let is_success = is_pr_merge_success_notification(&text);
+        if is_success {
             outcome.success_message_ids.push(message.id.clone());
         }
-        if is_pr_merge_failure_notification(&text) {
+        if !is_success && is_pr_merge_failure_notification(&text) {
             outcome.failure_message_ids.push(message.id.clone());
         }
     }
@@ -865,6 +866,17 @@ fn notification_text(message: &NormalizedMessage) -> String {
     parts.join(" ").to_lowercase()
 }
 
+fn pr_outcome_text(message: &NormalizedMessage) -> String {
+    let mut parts = vec![message.content.as_str()];
+    if message.embed_bodies.is_empty() {
+        parts.extend(message.embeds.iter().map(String::as_str));
+    } else {
+        parts.extend(message.embed_bodies.iter().map(String::as_str));
+    }
+    parts.extend(message.components.iter().map(String::as_str));
+    parts.join(" ").to_lowercase()
+}
+
 fn is_pr_approval_notification(text: &str) -> bool {
     text.contains("approved")
         && !text.contains("not approved")
@@ -881,12 +893,14 @@ fn is_pr_merge_success_notification(text: &str) -> bool {
 }
 
 fn is_pr_merge_failure_notification(text: &str) -> bool {
-    (text.contains("merge queue") || text.contains("mergequeue"))
+    ((text.contains("merge queue") || text.contains("mergequeue"))
         && (text.contains("failed")
             || text.contains("failure")
             || text.contains("error")
             || text.contains("could not merge")
-            || text.contains("unable to merge"))
+            || text.contains("unable to merge")))
+        || ((text.contains("tests failed") || text.contains("test failed"))
+            && (text.contains("won't merge") || text.contains("wont merge")))
 }
 
 fn is_merge_action(text: &str) -> bool {
@@ -1145,6 +1159,45 @@ mod tests {
         assert!(outcomes
             .get("https://github.com/example/repo/pull/789")
             .is_some_and(|outcome| outcome.success_message_ids == vec!["1".to_string()]));
+    }
+
+    #[test]
+    fn merge_success_with_validation_errors_in_title_is_not_a_failure() {
+        let mut merged = message("1", "");
+        merged.embeds = vec![
+            "Merge Queue: PR #285481 - [dev] show feedback when attempting to save or publish widget configs with validation errors | Your PR has been successfuwwy mewged. | https://github.com/example/repo/pull/285481"
+                .into(),
+        ];
+        merged.embed_bodies = vec!["Your PR has been successfuwwy mewged.".into()];
+
+        let outcomes = pr_merge_outcomes(&[merged]);
+        let outcome = outcomes
+            .get("https://github.com/example/repo/pull/285481")
+            .expect("PR outcome");
+
+        assert_eq!(outcome.success_message_ids, vec!["1".to_string()]);
+        assert!(outcome.failure_message_ids.is_empty());
+    }
+
+    #[test]
+    fn merge_queue_outcomes_ignore_embed_titles() {
+        let mut failed = message("1", "");
+        failed.embeds = vec![
+            "Merge Queue: PR #285481 - [dev] show feedback when attempting to save or publish widget configs with validation errors | Tests failed. The PR won't merge until all tests pass. Either submit again using /merge, or retry the failed test(s) - View tests | https://github.com/example/repo/pull/285481"
+                .into(),
+        ];
+        failed.embed_bodies = vec![
+            "Tests failed. The PR won't merge until all tests pass. Either submit again using /merge, or retry the failed test(s) - View tests"
+                .into(),
+        ];
+
+        let outcomes = pr_merge_outcomes(&[failed]);
+        let outcome = outcomes
+            .get("https://github.com/example/repo/pull/285481")
+            .expect("PR outcome");
+
+        assert!(outcome.success_message_ids.is_empty());
+        assert_eq!(outcome.failure_message_ids, vec!["1".to_string()]);
     }
 
     #[test]
@@ -1447,6 +1500,7 @@ mod tests {
             reply_to_id: None,
             attachments: Vec::new(),
             embeds: Vec::new(),
+            embed_bodies: Vec::new(),
             components: Vec::new(),
             mentions: Vec::new(),
         }

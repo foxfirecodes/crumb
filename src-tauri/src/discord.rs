@@ -32,6 +32,7 @@ pub struct NormalizedMessage {
     pub reply_to_id: Option<String>,
     pub attachments: Vec<String>,
     pub embeds: Vec<String>,
+    pub embed_bodies: Vec<String>,
     pub components: Vec<String>,
     pub mentions: Vec<NormalizedPerson>,
 }
@@ -815,6 +816,11 @@ impl From<ApiMessage> for NormalizedMessage {
             reply_to_id: value.message_reference.and_then(|r| r.message_id),
             attachments: value.attachments.into_iter().map(|a| a.url).collect(),
             embeds: value.embeds.iter().filter_map(summarize_embed).collect(),
+            embed_bodies: value
+                .embeds
+                .iter()
+                .filter_map(summarize_embed_body)
+                .collect(),
             components: value
                 .components
                 .iter()
@@ -885,6 +891,37 @@ fn summarize_embed(embed: &Value) -> Option<String> {
         if let Some(value) = object.get(key).and_then(Value::as_str) {
             parts.push(value.to_string());
         }
+    }
+    if let Some(fields) = object.get("fields").and_then(Value::as_array) {
+        for field in fields {
+            let Some(field_object) = field.as_object() else {
+                continue;
+            };
+            let name = field_object.get("name").and_then(Value::as_str);
+            let value = field_object.get("value").and_then(Value::as_str);
+            match (name, value) {
+                (Some(name), Some(value)) => parts.push(format!("{name}: {value}")),
+                (Some(name), None) => parts.push(name.to_string()),
+                (None, Some(value)) => parts.push(value.to_string()),
+                (None, None) => {}
+            }
+        }
+    }
+    if let Some(footer) = object
+        .get("footer")
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+    {
+        parts.push(footer.to_string());
+    }
+    clean_summary(parts.join(" | "))
+}
+
+fn summarize_embed_body(embed: &Value) -> Option<String> {
+    let object = embed.as_object()?;
+    let mut parts = Vec::new();
+    if let Some(description) = object.get("description").and_then(Value::as_str) {
+        parts.push(description.to_string());
     }
     if let Some(fields) = object.get("fields").and_then(Value::as_array) {
         for field in fields {
