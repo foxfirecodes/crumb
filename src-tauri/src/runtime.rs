@@ -15,7 +15,7 @@ use crate::discord::{
     DiscordBot, DiscordCommand, DiscordScraper, NormalizedMessage, NormalizedPerson, ScrapeRequest,
     WatchRequest,
 };
-use crate::events::{ScrapeSummary, SidecarStatus};
+use crate::events::{CanonicalActionItem, ScrapeSummary, SidecarStatus};
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WATCH_FETCH_LIMIT: usize = 100;
@@ -551,6 +551,7 @@ async fn extract_and_store(
         })
         .collect();
     add_pr_notification_fallbacks(&mut action_items, messages, Some(current_user));
+    reconcile_pr_merge_outcomes(&existing_actions, &mut action_items, messages, current_user);
 
     let updated = db.mark_extracted(
         scrape_id,
@@ -562,7 +563,13 @@ async fn extract_and_store(
         &action_items,
     )?;
     let after_actions = db.list_source_actions("discord", channel_id)?;
-    let new_action_count = after_actions
+    let auto_dismissed_count = dismiss_resolved_pr_merge_actions(db, &after_actions, messages)?;
+    let final_actions = if auto_dismissed_count > 0 {
+        db.list_source_actions("discord", channel_id)?
+    } else {
+        after_actions
+    };
+    let new_action_count = final_actions
         .iter()
         .filter(|action| {
             !existing_action_ids.contains(&action.id)
@@ -665,6 +672,105 @@ struct PrApprovalState {
     merged_after_approval: bool,
 }
 
+#[derive(Debug, Default)]
+struct PrMergeOutcome {
+    success_message_ids: Vec<String>,
+    failure_message_ids: Vec<String>,
+}
+
+fn reconcile_pr_merge_outcomes(
+    existing_actions: &[CanonicalActionItem],
+    action_items: &mut Vec<ActionCandidate>,
+    messages: &[NormalizedMessage],
+    current_user: &NormalizedPerson,
+) {
+    let outcomes = pr_merge_outcomes(messages);
+    for (url, outcome) in outcomes {
+        if !outcome.failure_message_ids.is_empty() {
+            if action_items.iter().any(|item| {
+                item.url.as_deref() == Some(url.as_str()) && is_merge_failure_action(&item.text)
+            }) {
+                continue;
+            }
+            let merge_with = existing_actions
+                .iter()
+                .find(|action| {
+                    action
+                        .url
+                        .as_deref()
+                        .and_then(|value| normalize_pr_url(Some(value)))
+                        == Some(url.clone())
+                        && is_merge_failure_action(&action.title)
+                })
+                .map(|action| action.id.clone());
+            action_items.push(ActionCandidate {
+                text: format!("Resolve merge queue failure for PR {}", pr_label(&url)),
+                assignee_key: Some(current_user.key.clone()),
+                assignee: Some(current_user.display_name.clone()),
+                due: None,
+                url: Some(url.clone()),
+                message_ids: outcome.failure_message_ids,
+                dedupe_key: Some(format!(
+                    "resolve-merge-queue-failure-{}",
+                    stable_pr_key(&url)
+                )),
+                merge_with,
+            });
+        }
+    }
+}
+
+fn dismiss_resolved_pr_merge_actions(
+    db: &Db,
+    actions: &[CanonicalActionItem],
+    messages: &[NormalizedMessage],
+) -> Result<usize> {
+    let resolved_urls = pr_merge_outcomes(messages)
+        .into_iter()
+        .filter_map(|(url, outcome)| {
+            (!outcome.success_message_ids.is_empty() || !outcome.failure_message_ids.is_empty())
+                .then_some(url)
+        })
+        .collect::<HashSet<_>>();
+    if resolved_urls.is_empty() {
+        return Ok(0);
+    }
+
+    let ids = actions
+        .iter()
+        .filter(|action| matches!(action.status.as_str(), "inbox" | "active" | "snoozed"))
+        .filter(|action| is_pr_merge_todo_action(&action.title))
+        .filter(|action| {
+            action
+                .url
+                .as_deref()
+                .and_then(|url| normalize_pr_url(Some(url)))
+                .is_some_and(|url| resolved_urls.contains(&url))
+        })
+        .map(|action| action.id.clone())
+        .collect::<Vec<_>>();
+
+    db.set_actions_status(&ids, "done")
+}
+
+fn pr_merge_outcomes(messages: &[NormalizedMessage]) -> BTreeMap<String, PrMergeOutcome> {
+    let mut outcomes = BTreeMap::new();
+    for message in messages {
+        let Some(url) = find_pr_url_in_message(message) else {
+            continue;
+        };
+        let text = notification_text(message);
+        let outcome: &mut PrMergeOutcome = outcomes.entry(url).or_default();
+        if is_pr_merge_success_notification(&text) {
+            outcome.success_message_ids.push(message.id.clone());
+        }
+        if is_pr_merge_failure_notification(&text) {
+            outcome.failure_message_ids.push(message.id.clone());
+        }
+    }
+    outcomes
+}
+
 fn add_pr_notification_fallbacks(
     action_items: &mut Vec<ActionCandidate>,
     messages: &[NormalizedMessage],
@@ -748,9 +854,35 @@ fn is_pr_merge_success_notification(text: &str) -> bool {
         || (text.contains("merge queue") && text.contains(" merged"))
 }
 
+fn is_pr_merge_failure_notification(text: &str) -> bool {
+    (text.contains("merge queue") || text.contains("mergequeue"))
+        && (text.contains("failed")
+            || text.contains("failure")
+            || text.contains("error")
+            || text.contains("could not merge")
+            || text.contains("unable to merge"))
+}
+
 fn is_merge_action(text: &str) -> bool {
     let text = text.to_lowercase();
     text.contains("merge") && (text.contains("pr") || text.contains("pull request"))
+}
+
+fn is_pr_merge_todo_action(text: &str) -> bool {
+    let text = text.to_lowercase();
+    !is_merge_failure_action(&text)
+        && ((text.contains("merge") && text.contains("approved") && is_merge_action(&text))
+            || text.contains("merge approved pr")
+            || text.contains("merge approved pull request")
+            || text.starts_with("merge pr")
+            || text.starts_with("merge pull request")
+            || text.contains(" merge pr ")
+            || text.contains(" merge pull request "))
+}
+
+fn is_merge_failure_action(text: &str) -> bool {
+    let text = text.to_lowercase();
+    text.contains("merge queue") && (text.contains("failure") || text.contains("failed"))
 }
 
 fn find_pr_url_for_action(
@@ -959,6 +1091,171 @@ mod tests {
         add_pr_notification_fallbacks(&mut actions, &[approved, merged], Some(&current_user));
 
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn merge_outcomes_canonicalize_embed_url_fragments() {
+        let mut merged = message("1", "");
+        merged.embeds = vec![
+            "Merge queue successfully merged https://github.com/example/repo/pull/789#issuecomment-123"
+                .into(),
+        ];
+
+        let outcomes = pr_merge_outcomes(&[merged]);
+
+        assert!(outcomes
+            .get("https://github.com/example/repo/pull/789")
+            .is_some_and(|outcome| outcome.success_message_ids == vec!["1".to_string()]));
+    }
+
+    #[test]
+    fn merge_queue_failure_creates_fix_action_for_current_user() {
+        let mut actions = Vec::new();
+        let mut failed = message("1", "");
+        failed.embeds = vec![
+            "Merge queue failed for https://github.com/example/repo/pull/789#issuecomment-123"
+                .into(),
+        ];
+        let current_user = current_user();
+
+        reconcile_pr_merge_outcomes(&[], &mut actions, &[failed], &current_user);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].text, "Resolve merge queue failure for PR #789");
+        assert_eq!(
+            actions[0].assignee_key.as_deref(),
+            Some("discord:user:current")
+        );
+        assert_eq!(
+            actions[0].url.as_deref(),
+            Some("https://github.com/example/repo/pull/789")
+        );
+        assert_eq!(
+            actions[0].dedupe_key.as_deref(),
+            Some("resolve-merge-queue-failure-github-com-example-repo-pull-789")
+        );
+    }
+
+    #[test]
+    fn merge_queue_failure_action_is_not_treated_as_merge_todo() {
+        assert!(is_pr_merge_todo_action("Merge approved PR #789"));
+        assert!(!is_pr_merge_todo_action(
+            "Resolve merge queue failure for PR #789"
+        ));
+    }
+
+    #[test]
+    fn merge_success_dismisses_matching_merge_todo() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-runtime-merge-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "scrape-1",
+            "channel-1",
+            Some("Nelly (DM)"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "scrape-1",
+            Some("1"),
+            Some("1"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Merge approved PR #789".into(),
+                assignee_key: Some("discord:user:current".into()),
+                assignee: Some("Current User".into()),
+                due: None,
+                url: Some("https://github.com/example/repo/pull/789".into()),
+                message_ids: vec!["1".into()],
+                dedupe_key: Some("merge-approved-pr-github-com-example-repo-pull-789".into()),
+                merge_with: None,
+            }],
+        )?;
+        let mut merged = message("2", "");
+        merged.embeds = vec![
+            "Merge queue successfully merged https://github.com/example/repo/pull/789#issuecomment-123"
+                .into(),
+        ];
+
+        let actions = db.list_source_actions("discord", "channel-1")?;
+        let dismissed = dismiss_resolved_pr_merge_actions(&db, &actions, &[merged])?;
+
+        assert_eq!(dismissed, 1);
+        assert!(db.list_open_action_items()?.is_empty());
+        assert_eq!(
+            db.list_source_actions("discord", "channel-1")?[0].status,
+            "done"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_failure_dismisses_merge_todo_but_keeps_failure_action() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-runtime-merge-failure-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "scrape-1",
+            "channel-1",
+            Some("Nelly (DM)"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "scrape-1",
+            Some("1"),
+            Some("2"),
+            2,
+            "summary",
+            &[],
+            &[
+                ActionCandidate {
+                    text: "Merge approved PR #789".into(),
+                    assignee_key: Some("discord:user:current".into()),
+                    assignee: Some("Current User".into()),
+                    due: None,
+                    url: Some("https://github.com/example/repo/pull/789".into()),
+                    message_ids: vec!["1".into()],
+                    dedupe_key: Some("merge-approved-pr-github-com-example-repo-pull-789".into()),
+                    merge_with: None,
+                },
+                ActionCandidate {
+                    text: "Resolve merge queue failure for PR #789".into(),
+                    assignee_key: Some("discord:user:current".into()),
+                    assignee: Some("Current User".into()),
+                    due: None,
+                    url: Some("https://github.com/example/repo/pull/789".into()),
+                    message_ids: vec!["2".into()],
+                    dedupe_key: Some(
+                        "resolve-merge-queue-failure-github-com-example-repo-pull-789".into(),
+                    ),
+                    merge_with: None,
+                },
+            ],
+        )?;
+        let mut failed = message("2", "");
+        failed.embeds =
+            vec!["Merge queue failed for https://github.com/example/repo/pull/789".into()];
+
+        let actions = db.list_source_actions("discord", "channel-1")?;
+        let dismissed = dismiss_resolved_pr_merge_actions(&db, &actions, &[failed])?;
+        let open = db.list_open_action_items()?;
+
+        assert_eq!(dismissed, 1);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].title, "Resolve merge queue failure for PR #789");
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
     }
 
     #[test]

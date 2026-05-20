@@ -210,6 +210,30 @@ impl Db {
             .context("action item vanished after status update")
     }
 
+    pub fn set_actions_status(&self, ids: &[String], status: &str) -> Result<usize> {
+        if !matches!(status, "inbox" | "active" | "snoozed" | "done" | "archived") {
+            bail!("invalid action item status: {status}");
+        }
+        let completed_at = if status == "done" {
+            Some(Utc::now().timestamp_millis())
+        } else {
+            None
+        };
+        let mut conn = self.inner.lock();
+        let tx = conn.transaction()?;
+        let mut changed = 0;
+        for id in ids {
+            changed += tx.execute(
+                "UPDATE canonical_action_items
+                 SET status = ?, completed_at = ?
+                 WHERE id = ? AND ? IN ('inbox','active','snoozed','done','archived')",
+                rusqlite::params![status, completed_at, id, status],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn set_action_assignee(
         &self,
         id: &str,
@@ -1033,30 +1057,32 @@ fn upsert_canonical_action(
         return Ok(action_id);
     }
 
-    if let Some(action_id) = find_similar_action_id(tx, source_kind, source_scope, text)? {
-        update_canonical_action(
-            tx,
-            &action_id,
-            now,
-            source_label,
-            text,
-            assignee_key,
-            assignee,
-            due,
-            url,
-        )?;
-        insert_action_evidence(
-            tx,
-            now,
-            &action_id,
-            source_kind,
-            source_scope,
-            source_label,
-            scrape_id,
-            text,
-            message_ids,
-        )?;
-        return Ok(action_id);
+    if ai_dedupe_key.is_none() {
+        if let Some(action_id) = find_similar_action_id(tx, source_kind, source_scope, text)? {
+            update_canonical_action(
+                tx,
+                &action_id,
+                now,
+                source_label,
+                text,
+                assignee_key,
+                assignee,
+                due,
+                url,
+            )?;
+            insert_action_evidence(
+                tx,
+                now,
+                &action_id,
+                source_kind,
+                source_scope,
+                source_label,
+                scrape_id,
+                text,
+                message_ids,
+            )?;
+            return Ok(action_id);
+        }
     }
 
     let dedupe_key = normalize_key(ai_dedupe_key.unwrap_or(text));
