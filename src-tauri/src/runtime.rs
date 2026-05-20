@@ -850,6 +850,7 @@ fn is_pr_approval_notification(text: &str) -> bool {
 
 fn is_pr_merge_success_notification(text: &str) -> bool {
     text.contains("successfully merged")
+        || text.contains("successfuwwy mewged")
         || text.contains("merged pull request")
         || (text.contains("merge queue") && text.contains(" merged"))
 }
@@ -1100,6 +1101,19 @@ mod tests {
             "Merge queue successfully merged https://github.com/example/repo/pull/789#issuecomment-123"
                 .into(),
         ];
+
+        let outcomes = pr_merge_outcomes(&[merged]);
+
+        assert!(outcomes
+            .get("https://github.com/example/repo/pull/789")
+            .is_some_and(|outcome| outcome.success_message_ids == vec!["1".to_string()]));
+    }
+
+    #[test]
+    fn merge_outcomes_detect_uwu_merge_success() {
+        let mut merged = message("1", "");
+        merged.embeds =
+            vec!["Merge queue successfuwwy mewged https://github.com/example/repo/pull/789".into()];
 
         let outcomes = pr_merge_outcomes(&[merged]);
 
