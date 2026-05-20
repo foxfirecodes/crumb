@@ -89,43 +89,27 @@ impl DiscordBot {
 
     pub async fn register_commands(&self) -> Result<()> {
         let url = format!("{DISCORD_API}/applications/{}/commands", self.app_id);
-        let body = json!([
-            {
-                "type": 1,
-                "name": "scrape",
-                "description": "Pull recent messages from this channel and extract decisions + action items.",
-                "options": [
-                    {
-                        "type": 4,
-                        "name": "limit",
-                        "description": "How many recent messages to scrape (1-1000, default 200)",
-                        "min_value": 1,
-                        "max_value": 1000,
-                        "required": false
-                    }
-                ],
-                "integration_types": [1, 0],
-                "contexts": [0, 1, 2]
-            },
-            {
-                "type": 1,
-                "name": "watch",
-                "description": "Watch this channel for new action items every few minutes.",
-                "integration_types": [1, 0],
-                "contexts": [0, 1, 2]
-            },
-            {
-                "type": 1,
-                "name": "unwatch",
-                "description": "Stop watching this channel for new action items.",
-                "integration_types": [1, 0],
-                "contexts": [0, 1, 2]
-            }
-        ]);
+        let body = application_command_definitions();
 
         let response = self
             .http
-            .put(url)
+            .get(&url)
+            .header(AUTHORIZATION, bot_auth(&self.token))
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .send()
+            .await
+            .context("fetching Discord commands")?;
+        let existing: Value = parse_json_response(response)
+            .await
+            .context("Discord command fetch failed")?;
+        if application_commands_match(&existing, &body) {
+            tracing::info!("Discord commands already up to date");
+            return Ok(());
+        }
+
+        let response = self
+            .http
+            .put(&url)
             .header(AUTHORIZATION, bot_auth(&self.token))
             .header(USER_AGENT, USER_AGENT_VALUE)
             .json(&body)
@@ -419,6 +403,106 @@ impl DiscordBot {
         let channel: PartialChannel = parse_json_response(response).await?;
         Ok(format_interaction_channel_name(Some(&channel), guild_id))
     }
+}
+
+fn application_command_definitions() -> Value {
+    json!([
+        {
+            "type": 1,
+            "name": "scrape",
+            "description": "Pull recent messages from this channel and extract decisions + action items.",
+            "options": [
+                {
+                    "type": 4,
+                    "name": "limit",
+                    "description": "How many recent messages to scrape (1-1000, default 200)",
+                    "min_value": 1,
+                    "max_value": 1000,
+                    "required": false
+                }
+            ],
+            "integration_types": [1, 0],
+            "contexts": [0, 1, 2]
+        },
+        {
+            "type": 1,
+            "name": "watch",
+            "description": "Watch this channel for new action items every few minutes.",
+            "integration_types": [1, 0],
+            "contexts": [0, 1, 2]
+        },
+        {
+            "type": 1,
+            "name": "unwatch",
+            "description": "Stop watching this channel for new action items.",
+            "integration_types": [1, 0],
+            "contexts": [0, 1, 2]
+        }
+    ])
+}
+
+fn application_commands_match(existing: &Value, desired: &Value) -> bool {
+    comparable_application_commands(existing) == comparable_application_commands(desired)
+}
+
+fn comparable_application_commands(value: &Value) -> Option<Vec<Value>> {
+    let mut commands = value
+        .as_array()?
+        .iter()
+        .filter_map(comparable_application_command)
+        .collect::<Vec<_>>();
+    commands.sort_by_key(command_name);
+    Some(commands)
+}
+
+fn comparable_application_command(command: &Value) -> Option<Value> {
+    let object = command.as_object()?;
+    let mut options = object
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(comparable_application_command_option)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    options.sort_by_key(command_name);
+
+    Some(json!({
+        "type": object.get("type").cloned().unwrap_or(Value::Null),
+        "name": object.get("name").cloned().unwrap_or(Value::Null),
+        "description": object.get("description").cloned().unwrap_or(Value::Null),
+        "integration_types": sorted_values(object.get("integration_types")),
+        "contexts": sorted_values(object.get("contexts")),
+        "options": options
+    }))
+}
+
+fn comparable_application_command_option(option: &Value) -> Option<Value> {
+    let object = option.as_object()?;
+    Some(json!({
+        "type": object.get("type").cloned().unwrap_or(Value::Null),
+        "name": object.get("name").cloned().unwrap_or(Value::Null),
+        "description": object.get("description").cloned().unwrap_or(Value::Null),
+        "required": object.get("required").cloned().unwrap_or(Value::Bool(false)),
+        "min_value": object.get("min_value").cloned().unwrap_or(Value::Null),
+        "max_value": object.get("max_value").cloned().unwrap_or(Value::Null)
+    }))
+}
+
+fn sorted_values(value: Option<&Value>) -> Value {
+    let mut values = value.and_then(Value::as_array).cloned().unwrap_or_default();
+    values.sort_by_key(|value| value.to_string());
+    Value::Array(values)
+}
+
+fn command_name(command: &Value) -> String {
+    command
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -903,4 +987,54 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(
 #[derive(Debug, Deserialize)]
 struct RateLimit {
     retry_after: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_match_ignores_discord_metadata_and_empty_options() {
+        let desired = application_command_definitions();
+        let mut existing = application_command_definitions();
+        let commands = existing.as_array_mut().expect("commands array");
+        for (index, command) in commands.iter_mut().enumerate() {
+            command["id"] = json!(format!("command-{index}"));
+            command["application_id"] = json!("app-id");
+            command["version"] = json!("version-id");
+            if command.get("options").is_none() {
+                command["options"] = json!([]);
+            }
+        }
+
+        assert!(application_commands_match(&existing, &desired));
+    }
+
+    #[test]
+    fn command_match_detects_definition_changes() {
+        let desired = application_command_definitions();
+        let mut existing = application_command_definitions();
+        existing.as_array_mut().expect("commands array")[0]["description"] =
+            json!("Different scrape description");
+
+        assert!(!application_commands_match(&existing, &desired));
+    }
+
+    #[test]
+    fn command_match_detects_extra_registered_commands() {
+        let desired = application_command_definitions();
+        let mut existing = application_command_definitions();
+        existing
+            .as_array_mut()
+            .expect("commands array")
+            .push(json!({
+                "type": 1,
+                "name": "old-command",
+                "description": "A command that should be removed.",
+                "integration_types": [1, 0],
+                "contexts": [0, 1, 2]
+            }));
+
+        assert!(!application_commands_match(&existing, &desired));
+    }
 }
