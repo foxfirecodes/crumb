@@ -95,23 +95,13 @@ DISCORD_USER_TOKEN=...
 
 Claude auth is reused from your existing Claude Code login. You do not need an Anthropic API key for the default setup.
 
-4. Authorize the Discord slash commands for your account:
-
-   - Create an application in the Discord Developer Portal.
-   - Go to the application's **Installation** page.
-   - Enable **User Install**.
-   - Set **Install Link** to **Discord Provided Link**.
-   - Under **Default Install Settings** -> **User Install**, set scopes to `application.commands`.
-   - Copy the Discord-provided install link and open it in your browser.
-   - Authorize the app for your account.
-
-5. Run the app:
+4. Run the app:
 
 ```bash
 npm run tauri:dev
 ```
 
-6. Try `/scrape` in a DM or channel.
+5. Install the Discord app to your account, then try `/scrape` in a DM or channel.
 
 For the full Discord app/token walkthrough, read [docs/discord-setup.md](docs/discord-setup.md).
 
@@ -130,3 +120,4 @@ Crumb stores its local state in a SQLite database in the app data directory. Dis
 ## Current Scope
 
 Crumb is a personal workflow tool, not a team SaaS. Today it focuses on Discord, PR notifications, action item extraction, and a local macOS menu bar UI.
+
