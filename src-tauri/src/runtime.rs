@@ -687,22 +687,25 @@ fn reconcile_pr_merge_outcomes(
     let outcomes = pr_merge_outcomes(messages);
     for (url, outcome) in outcomes {
         if !outcome.failure_message_ids.is_empty() {
-            if action_items.iter().any(|item| {
+            let merge_with = existing_merge_failure_action(existing_actions, &url)
+                .map(|action| action.id.clone());
+            let dedupe_key = merge_failure_dedupe_key(&url);
+            let mut found_existing_candidate = false;
+            for item in action_items.iter_mut().filter(|item| {
                 item.url.as_deref() == Some(url.as_str()) && is_merge_failure_action(&item.text)
             }) {
+                item.assignee_key = Some(current_user.key.clone());
+                item.assignee = Some(current_user.display_name.clone());
+                item.dedupe_key = Some(dedupe_key.clone());
+                item.merge_with = merge_with.clone();
+                if item.message_ids.is_empty() {
+                    item.message_ids = outcome.failure_message_ids.clone();
+                }
+                found_existing_candidate = true;
+            }
+            if found_existing_candidate {
                 continue;
             }
-            let merge_with = existing_actions
-                .iter()
-                .find(|action| {
-                    action
-                        .url
-                        .as_deref()
-                        .and_then(|value| normalize_pr_url(Some(value)))
-                        == Some(url.clone())
-                        && is_merge_failure_action(&action.title)
-                })
-                .map(|action| action.id.clone());
             action_items.push(ActionCandidate {
                 text: format!("Resolve merge queue failure for PR {}", pr_label(&url)),
                 assignee_key: Some(current_user.key.clone()),
@@ -710,10 +713,7 @@ fn reconcile_pr_merge_outcomes(
                 due: None,
                 url: Some(url.clone()),
                 message_ids: outcome.failure_message_ids,
-                dedupe_key: Some(format!(
-                    "resolve-merge-queue-failure-{}",
-                    stable_pr_key(&url)
-                )),
+                dedupe_key: Some(dedupe_key),
                 merge_with,
             });
         }
@@ -725,13 +725,15 @@ fn dismiss_resolved_pr_merge_actions(
     actions: &[CanonicalActionItem],
     messages: &[NormalizedMessage],
 ) -> Result<usize> {
-    let resolved_urls = pr_merge_outcomes(messages)
-        .into_iter()
-        .filter_map(|(url, outcome)| {
-            (!outcome.success_message_ids.is_empty() || !outcome.failure_message_ids.is_empty())
-                .then_some(url)
-        })
-        .collect::<HashSet<_>>();
+    let mut resolved_urls = HashSet::new();
+    for (url, outcome) in pr_merge_outcomes(messages) {
+        if !outcome.success_message_ids.is_empty() {
+            resolved_urls.insert(url.clone());
+        }
+        if !outcome.failure_message_ids.is_empty() && has_open_merge_failure_action(actions, &url) {
+            resolved_urls.insert(url);
+        }
+    }
     if resolved_urls.is_empty() {
         return Ok(0);
     }
@@ -753,6 +755,25 @@ fn dismiss_resolved_pr_merge_actions(
     db.set_actions_status(&ids, "done")
 }
 
+fn existing_merge_failure_action<'a>(
+    actions: &'a [CanonicalActionItem],
+    url: &str,
+) -> Option<&'a CanonicalActionItem> {
+    actions.iter().find(|action| {
+        action
+            .url
+            .as_deref()
+            .and_then(|value| normalize_pr_url(Some(value)))
+            .is_some_and(|value| value == url)
+            && is_merge_failure_action(&action.title)
+    })
+}
+
+fn has_open_merge_failure_action(actions: &[CanonicalActionItem], url: &str) -> bool {
+    existing_merge_failure_action(actions, url)
+        .is_some_and(|action| matches!(action.status.as_str(), "inbox" | "active" | "snoozed"))
+}
+
 fn pr_merge_outcomes(messages: &[NormalizedMessage]) -> BTreeMap<String, PrMergeOutcome> {
     let mut outcomes = BTreeMap::new();
     for message in messages {
@@ -769,6 +790,10 @@ fn pr_merge_outcomes(messages: &[NormalizedMessage]) -> BTreeMap<String, PrMerge
         }
     }
     outcomes
+}
+
+fn merge_failure_dedupe_key(url: &str) -> String {
+    format!("resolve-merge-queue-failure-{}", stable_pr_key(url))
 }
 
 fn add_pr_notification_fallbacks(
@@ -1267,6 +1292,103 @@ mod tests {
         assert_eq!(dismissed, 1);
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].title, "Resolve merge queue failure for PR #789");
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_failure_ai_candidate_does_not_collapse_into_merge_todo() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-runtime-merge-failure-ai-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "scrape-1",
+            "channel-1",
+            Some("Nelly (DM)"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "scrape-1",
+            Some("1"),
+            Some("1"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Merge PR #285629 - generate API JSON from widget sample data".into(),
+                assignee_key: Some("discord:user:current".into()),
+                assignee: Some("Current User".into()),
+                due: None,
+                url: Some("https://github.com/discord/discord/pull/285629".into()),
+                message_ids: vec!["1".into()],
+                dedupe_key: Some("merge-pr-github-com-discord-discord-pull-285629".into()),
+                merge_with: None,
+            }],
+        )?;
+        let existing_actions = db.list_source_actions("discord", "channel-1")?;
+        let merge_action_id = existing_actions[0].id.clone();
+        let mut failed = message("2", "");
+        failed.embeds = vec![
+            "Merge Queue: PR #285629 - generate API JSON from widget sample data | Tests failed. The PR won't merge until all tests pass. Either submit again using /merge, or retry the failed test(s) - View tests | https://github.com/discord/discord/pull/285629"
+                .into(),
+        ];
+        let current_user = current_user();
+        let mut action_items = vec![ActionCandidate {
+            text: "Resolve merge queue test failure for PR #285629 - generate API JSON from widget sample data".into(),
+            assignee_key: None,
+            assignee: None,
+            due: None,
+            url: Some("https://github.com/discord/discord/pull/285629".into()),
+            message_ids: vec!["2".into()],
+            dedupe_key: None,
+            merge_with: Some(merge_action_id),
+        }];
+
+        reconcile_pr_merge_outcomes(
+            &existing_actions,
+            &mut action_items,
+            &[failed.clone()],
+            &current_user,
+        );
+
+        assert_eq!(
+            action_items[0].dedupe_key.as_deref(),
+            Some("resolve-merge-queue-failure-github-com-discord-discord-pull-285629")
+        );
+        assert!(action_items[0].merge_with.is_none());
+
+        db.insert_running(
+            "scrape-2",
+            "channel-1",
+            Some("Nelly (DM)"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "scrape-2",
+            Some("2"),
+            Some("2"),
+            1,
+            "summary",
+            &[],
+            &action_items,
+        )?;
+        let after_actions = db.list_source_actions("discord", "channel-1")?;
+        let dismissed = dismiss_resolved_pr_merge_actions(&db, &after_actions, &[failed])?;
+        let open = db.list_open_action_items()?;
+
+        assert_eq!(dismissed, 1);
+        assert_eq!(open.len(), 1);
+        assert_eq!(
+            open[0].title,
+            "Resolve merge queue test failure for PR #285629 - generate API JSON from widget sample data"
+        );
 
         let _ = std::fs::remove_file(db_path);
         Ok(())

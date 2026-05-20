@@ -1346,7 +1346,7 @@ fn merge_similar_canonical_actions(
     source_scope: &str,
 ) -> Result<()> {
     let mut stmt = tx.prepare(
-        "SELECT id, title, status, first_seen_at, last_seen_at
+        "SELECT id, title, status, first_seen_at, last_seen_at, url
          FROM canonical_action_items
          WHERE source_kind = ? AND source_scope = ?
            AND status IN ('inbox','active','snoozed','done')
@@ -1360,6 +1360,7 @@ fn merge_similar_canonical_actions(
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1379,6 +1380,14 @@ fn merge_similar_canonical_actions(
             if removed.contains(&candidate.0) {
                 continue;
             }
+            if should_skip_pr_outcome_similarity_merge(
+                &actions[i].1,
+                actions[i].5.as_deref(),
+                &candidate.1,
+                candidate.5.as_deref(),
+            ) {
+                continue;
+            }
             let score = token_similarity(&keep_tokens, &action_tokens(&candidate.1));
             if score < 0.72 {
                 continue;
@@ -1390,6 +1399,58 @@ fn merge_similar_canonical_actions(
     }
 
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PrActionKind {
+    MergeTodo,
+    MergeFailure,
+}
+
+fn should_skip_pr_outcome_similarity_merge(
+    left_title: &str,
+    left_url: Option<&str>,
+    right_title: &str,
+    right_url: Option<&str>,
+) -> bool {
+    let Some(left_url) = left_url else {
+        return false;
+    };
+    let Some(right_url) = right_url else {
+        return false;
+    };
+    if left_url != right_url {
+        return false;
+    }
+
+    matches!(
+        (pr_action_kind(left_title), pr_action_kind(right_title)),
+        (
+            Some(PrActionKind::MergeTodo),
+            Some(PrActionKind::MergeFailure)
+        ) | (
+            Some(PrActionKind::MergeFailure),
+            Some(PrActionKind::MergeTodo)
+        )
+    )
+}
+
+fn pr_action_kind(text: &str) -> Option<PrActionKind> {
+    let text = text.to_lowercase();
+    if text.contains("merge queue")
+        && (text.contains("failure") || text.contains("failed") || text.contains("failing"))
+    {
+        return Some(PrActionKind::MergeFailure);
+    }
+    if text.contains("merge")
+        && (text.contains("pr") || text.contains("pull request"))
+        && !text.contains("failure")
+        && !text.contains("failed")
+        && !text.contains("failing")
+    {
+        return Some(PrActionKind::MergeTodo);
+    }
+    None
 }
 
 fn merge_canonical_action(
