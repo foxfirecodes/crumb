@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::async_runtime;
@@ -16,6 +17,7 @@ use crate::discord::{
     WatchRequest,
 };
 use crate::events::{CanonicalActionItem, ScrapeSummary, SidecarStatus};
+use crate::settings::AppSettings;
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WATCH_FETCH_LIMIT: usize = 100;
@@ -24,6 +26,7 @@ const WATCH_FETCH_LIMIT: usize = 100;
 pub struct RuntimeHandle {
     status: Arc<Mutex<SidecarStatus>>,
     shutdown_tx: watch::Sender<bool>,
+    active: Arc<AtomicBool>,
 }
 
 impl RuntimeHandle {
@@ -35,9 +38,53 @@ impl RuntimeHandle {
         let _ = self.shutdown_tx.send(true);
     }
 
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
     fn set_status(&self, s: SidecarStatus, app: &AppHandle) {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
         *self.status.lock() = s.clone();
         let _ = app.emit("sidecar:status", &s);
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeManager {
+    app: AppHandle,
+    db: Db,
+    current: Arc<Mutex<RuntimeHandle>>,
+}
+
+impl RuntimeManager {
+    pub fn start(app: AppHandle, db: Db) -> Result<Self> {
+        let handle = spawn(app.clone(), db.clone())?;
+        Ok(Self {
+            app,
+            db,
+            current: Arc::new(Mutex::new(handle)),
+        })
+    }
+
+    pub fn status(&self) -> SidecarStatus {
+        self.current.lock().status()
+    }
+
+    pub async fn restart(&self) -> Result<()> {
+        let old = self.current.lock().clone();
+        old.deactivate();
+        old.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let next = spawn(self.app.clone(), self.db.clone())?;
+        *self.current.lock() = next;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        let current = self.current.lock().clone();
+        current.shutdown().await;
     }
 }
 
@@ -46,6 +93,7 @@ pub fn spawn(app: AppHandle, db: Db) -> Result<RuntimeHandle> {
     let handle = RuntimeHandle {
         status: Arc::new(Mutex::new(SidecarStatus::Starting)),
         shutdown_tx,
+        active: Arc::new(AtomicBool::new(true)),
     };
     handle.set_status(SidecarStatus::Starting, &app);
 
@@ -71,11 +119,19 @@ async fn run(
     handle: RuntimeHandle,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (bot_token, app_id, user_token) = crate::env::load_discord_env(&app)?;
-    let bot_token = bot_token.ok_or_else(|| anyhow!("missing DISCORD_BOT_TOKEN"))?;
-    let app_id = app_id.ok_or_else(|| anyhow!("missing DISCORD_APP_ID"))?;
+    let settings = crate::settings::load_or_import(&app)?;
+    let missing = settings.missing_runtime_fields();
+    if !missing.is_empty() {
+        handle.set_status(SidecarStatus::NeedsSetup { missing }, &app);
+        let mut shutdown_rx = shutdown_rx;
+        let _ = shutdown_rx.changed().await;
+        return Ok(());
+    }
 
-    let scraper = match user_token {
+    let bot_token = settings.discord_bot_token.clone();
+    let app_id = settings.discord_app_id.clone();
+
+    let scraper = match settings.discord_user_token() {
         Some(token) => match DiscordScraper::connect(token).await {
             Ok(scraper) => {
                 tracing::info!(
@@ -86,13 +142,13 @@ async fn run(
             }
             Err(e) => {
                 tracing::warn!(
-                    "scraper offline: {e}. /scrape will reject until DISCORD_USER_TOKEN is valid."
+                    "scraper offline: {e}. /scrape will reject until the Discord user token is valid."
                 );
                 None
             }
         },
         None => {
-            tracing::warn!("no DISCORD_USER_TOKEN provided; /scrape will be rejected");
+            tracing::warn!("no Discord user token provided; /scrape will be rejected");
             None
         }
     };
@@ -128,7 +184,7 @@ async fn run(
         work_tx,
         shutdown_rx.clone(),
     ));
-    work_loop(app.clone(), db, scraper, work_rx, shutdown_rx).await;
+    work_loop(app.clone(), db, scraper, settings, work_rx, shutdown_rx).await;
     handle.set_status(SidecarStatus::Disconnected, &app);
     Ok(())
 }
@@ -211,6 +267,7 @@ async fn work_loop(
     app: AppHandle,
     db: Db,
     scraper: Option<DiscordScraper>,
+    settings: AppSettings,
     mut work_rx: mpsc::UnboundedReceiver<WorkItem>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -225,17 +282,23 @@ async fn work_loop(
                     break;
                 };
                 match item {
-                    WorkItem::Scrape(req) => do_scrape(app.clone(), db.clone(), scraper.clone(), req).await,
+                    WorkItem::Scrape(req) => do_scrape(app.clone(), db.clone(), scraper.clone(), settings.clone(), req).await,
                     WorkItem::Watch(req) => do_watch(db.clone(), scraper.clone(), req).await,
                     WorkItem::Unwatch(req) => do_unwatch(db.clone(), req).await,
-                    WorkItem::Poll(channel) => do_watch_poll(app.clone(), db.clone(), scraper.clone(), channel).await,
+                    WorkItem::Poll(channel) => do_watch_poll(app.clone(), db.clone(), scraper.clone(), settings.clone(), channel).await,
                 }
             }
         }
     }
 }
 
-async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req: ScrapeRequest) {
+async fn do_scrape(
+    app: AppHandle,
+    db: Db,
+    scraper: Option<DiscordScraper>,
+    settings: AppSettings,
+    req: ScrapeRequest,
+) {
     match db.insert_running(
         &req.scrape_id,
         &req.channel_id,
@@ -255,7 +318,7 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
     }
 
     let Some(scraper) = scraper else {
-        let msg = "Scraper is offline. DISCORD_USER_TOKEN is missing or rejected. Re-extract it from the Discord web app and restart Crumb.";
+        let msg = "Scraper is offline. The Discord user token is missing or rejected. Re-extract it from the Discord web app and restart Crumb.";
         emit_failed(&app, &db, &req.scrape_id, msg);
         let _ = req.reply.send(msg).await;
         return;
@@ -301,6 +364,7 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
             &req.scrape_id,
             &req.channel_id,
             &messages,
+            &settings,
         )
         .await
         .context("extraction failed")
@@ -338,7 +402,7 @@ async fn do_scrape(app: AppHandle, db: Db, scraper: Option<DiscordScraper>, req:
 
 async fn do_watch(db: Db, scraper: Option<DiscordScraper>, req: WatchRequest) {
     let Some(scraper) = scraper else {
-        let msg = "Watcher is offline. DISCORD_USER_TOKEN is missing or rejected. Re-extract it from the Discord web app and restart Crumb.";
+        let msg = "Watcher is offline. The Discord user token is missing or rejected. Re-extract it from the Discord web app and restart Crumb.";
         let _ = req.reply.send(msg).await;
         return;
     };
@@ -409,6 +473,7 @@ async fn do_watch_poll(
     app: AppHandle,
     db: Db,
     scraper: Option<DiscordScraper>,
+    settings: AppSettings,
     channel: WatchedChannel,
 ) {
     let Some(scraper) = scraper else {
@@ -458,6 +523,7 @@ async fn do_watch_poll(
             &scrape_id,
             &channel.channel_id,
             &messages,
+            &settings,
         )
         .await?;
         db.update_watch_cursor(
@@ -499,6 +565,7 @@ async fn extract_and_store(
     scrape_id: &str,
     channel_id: &str,
     messages: &[NormalizedMessage],
+    settings: &AppSettings,
 ) -> Result<ExtractionOutcome> {
     let existing_actions = db.list_source_actions("discord", channel_id)?;
     let existing_action_ids = existing_actions
@@ -516,6 +583,7 @@ async fn extract_and_store(
         &existing_actions,
         &existing_decisions,
         Some(current_user),
+        settings,
     )
     .await?;
 
@@ -1051,7 +1119,7 @@ fn pr_label(url: &str) -> String {
 
 fn user_facing_scrape_error(error: &str) -> String {
     if error.contains("Authentication required") {
-        return "Claude Code authentication is required for extraction. Run `claude` in a terminal and complete login, or unset/fix `CRUMB_CLAUDE_CONFIG_DIR` if it points at an unauthenticated config.".into();
+        return "Claude Code authentication is required for extraction. Run `claude` in a terminal and complete login, or clear/fix the configured Claude config dir if it points at an unauthenticated config.".into();
     }
     error.into()
 }

@@ -10,6 +10,7 @@ import {
   onScrapeNew,
   onScrapeUpdated,
   onSidecarStatus,
+  openSettingsWindow,
   setActionItemAssignee,
   setActionItemStatus,
 } from "./lib/ipc";
@@ -174,6 +175,10 @@ export default function App() {
     openUrl(url).catch(console.error);
   };
 
+  const openSettings = () => {
+    openSettingsWindow().catch(console.error);
+  };
+
   const removeSource = (id: string) => {
     if (pendingDeleteId !== id) {
       setPendingDeleteId(id);
@@ -218,10 +223,27 @@ export default function App() {
             Sources
           </button>
         </nav>
+        <button
+          className="popover__settings"
+          onClick={openSettings}
+          title="Settings"
+        >
+          ⚙
+        </button>
       </header>
 
       <main className="popover__body">
-        {view === "actions" ? (
+        {status.kind === "needssetup" ? (
+          <div className="empty">
+            <div>Setup needed</div>
+            <div className="empty__hint">
+              Missing {status.missing.join(", ")}
+            </div>
+            <button className="empty__action" onClick={openSettings}>
+              Open Settings
+            </button>
+          </div>
+        ) : view === "actions" ? (
           <ActionList
             actions={filteredActions}
             statusFilter={actionStatusFilter}

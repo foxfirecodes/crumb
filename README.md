@@ -79,31 +79,29 @@ Crumb currently runs as a local developer app. You will need:
 npm install
 ```
 
-2. Copy the environment template:
-
-```bash
-cp .env.example .env
-```
-
-3. Fill in `.env`:
-
-```bash
-DISCORD_APP_ID=...
-DISCORD_BOT_TOKEN=...
-DISCORD_USER_TOKEN=...
-```
-
-Claude auth is reused from your existing Claude Code login. You do not need an Anthropic API key for the default setup.
-
-4. Run the app:
+2. Run the app:
 
 ```bash
 npm run tauri:dev
 ```
 
-5. Install the Discord app to your account, then try `/scrape` in a DM or channel.
+3. Open **Settings...** from the tray menu and fill in your Discord application ID, bot token, and user token.
+
+Claude auth is reused from your existing Claude Code login. You do not need an Anthropic API key for the default setup.
+
+4. Install the Discord app to your account, then try `/scrape` in a DM or channel.
 
 For the full Discord app/token walkthrough, read [docs/discord-setup.md](docs/discord-setup.md).
+
+## Installing The App Bundle
+
+Build a raw macOS app bundle:
+
+```bash
+npm run tauri:build
+```
+
+Then copy `src-tauri/target/release/bundle/macos/Crumb.app` into `/Applications` and launch it from Finder. Crumb stores settings in the app data directory and no longer needs a repo-local `.env` file for normal use.
 
 ## Useful Commands
 
@@ -115,9 +113,8 @@ cargo test          # run Rust tests from src-tauri/
 
 ## Data And Privacy
 
-Crumb stores its local state in a SQLite database in the app data directory. Discord messages are fetched for extraction and summarized into local sources/action evidence. Your `.env` contains sensitive credentials and must stay out of git.
+Crumb stores its local state and settings in the app data directory. Discord messages are fetched for extraction and summarized into local sources/action evidence. Discord tokens are stored in local app settings for now, so only run Crumb on a machine/account you trust.
 
 ## Current Scope
 
 Crumb is a personal workflow tool, not a team SaaS. Today it focuses on Discord, PR notifications, action item extraction, and a local macOS menu bar UI.
-

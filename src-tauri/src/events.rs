@@ -100,6 +100,9 @@ pub struct ScrapeDetail {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SidecarStatus {
     Starting,
+    NeedsSetup {
+        missing: Vec<String>,
+    },
     Connected {
         #[serde(rename = "botUser")]
         bot_user: Option<String>,

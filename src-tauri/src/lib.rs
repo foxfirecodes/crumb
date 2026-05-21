@@ -5,9 +5,9 @@ mod ai;
 mod commands;
 mod db;
 mod discord;
-mod env;
 mod events;
 mod runtime;
+mod settings;
 
 use tauri::{
     image::Image,
@@ -31,6 +31,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::list_scrapes,
             commands::get_scrape,
@@ -40,6 +44,13 @@ pub fn run() {
             commands::set_action_item_assignee,
             commands::get_sidecar_status,
             commands::hide_popover,
+            commands::get_app_settings,
+            commands::save_app_settings,
+            commands::test_discord_settings,
+            commands::test_ai_settings,
+            commands::open_settings_window,
+            commands::get_launch_at_login,
+            commands::set_launch_at_login,
         ])
         .setup(|app| {
             // Menubar app: no Dock icon, no menu bar.
@@ -50,12 +61,13 @@ pub fn run() {
             let database = db::Db::open(&db_path)?;
             app.manage(database.clone());
 
-            let handle = runtime::spawn(app.handle().clone(), database)?;
-            app.manage(handle);
+            let runtime = runtime::RuntimeManager::start(app.handle().clone(), database)?;
+            app.manage(runtime);
 
             let tray_menu = MenuBuilder::new(app)
                 .items(&[
                     &MenuItemBuilder::with_id("show", "Show Crumb").build(app)?,
+                    &MenuItemBuilder::with_id("settings", "Settings...").build(app)?,
                     &MenuItemBuilder::with_id("quit", "Quit Crumb").build(app)?,
                 ])
                 .build()?;
@@ -69,6 +81,9 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => {
                         let _ = show_popover_centered(app);
+                    }
+                    "settings" => {
+                        let _ = show_settings_window(app);
                     }
                     "quit" => {
                         graceful_exit(app);
@@ -168,10 +183,20 @@ fn show_popover_centered(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+pub fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
+    let Some(win) = app.get_webview_window("settings") else {
+        return Ok(());
+    };
+    win.center()?;
+    win.show()?;
+    win.set_focus()?;
+    Ok(())
+}
+
 fn graceful_exit(app: &AppHandle) {
-    if let Some(handle) = app.try_state::<runtime::RuntimeHandle>() {
-        let h = handle.inner().clone();
-        tauri::async_runtime::spawn(async move { h.shutdown().await });
+    if let Some(runtime) = app.try_state::<runtime::RuntimeManager>() {
+        let runtime = runtime.inner().clone();
+        tauri::async_runtime::spawn(async move { runtime.shutdown().await });
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {

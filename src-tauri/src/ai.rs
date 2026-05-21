@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::discord::{NormalizedMessage, NormalizedPerson};
 use crate::events::{CanonicalActionItem, Decision};
+use crate::settings::{AppSettings, SettingsTestResult};
 
 const DEFAULT_ACP_AGENT_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.33.1";
 
@@ -107,6 +109,7 @@ pub async fn extract(
     existing_actions: &[CanonicalActionItem],
     existing_decisions: &[Decision],
     current_user: Option<&NormalizedPerson>,
+    settings: &AppSettings,
 ) -> Result<ExtractionResult> {
     if messages.is_empty() {
         return Ok(ExtractionResult {
@@ -116,11 +119,12 @@ pub async fn extract(
         });
     }
 
-    let agent = build_acp_agent()?;
+    let agent = build_acp_agent(settings)?;
 
     let response = run_acp_prompt(
         agent,
         build_prompt(messages, existing_actions, existing_decisions, current_user)?,
+        settings,
     )
     .await?;
     let json = extract_json_object(&response).with_context(|| {
@@ -135,9 +139,14 @@ pub async fn extract(
     })
 }
 
-async fn run_acp_prompt(agent: acp::AcpAgent, prompt: String) -> Result<String> {
+async fn run_acp_prompt(
+    agent: acp::AcpAgent,
+    prompt: String,
+    settings: &AppSettings,
+) -> Result<String> {
     let output = Arc::new(Mutex::new(String::new()));
     let output_for_handler = output.clone();
+    let session_meta = acp_session_meta(settings);
 
     acp::Client
         .builder()
@@ -164,6 +173,7 @@ async fn run_acp_prompt(agent: acp::AcpAgent, prompt: String) -> Result<String> 
         )
         .connect_with(agent, move |connection: acp::ConnectionTo<acp::Agent>| {
             let prompt = prompt.clone();
+            let session_meta = session_meta.clone();
             async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1).client_info(
@@ -173,9 +183,7 @@ async fn run_acp_prompt(agent: acp::AcpAgent, prompt: String) -> Result<String> 
                     .await?;
 
                 let session = connection
-                    .send_request(
-                        NewSessionRequest::new(agent_workspace()).meta(acp_session_meta()),
-                    )
+                    .send_request(NewSessionRequest::new(agent_workspace()).meta(session_meta))
                     .block_task()
                     .await?;
 
@@ -204,28 +212,63 @@ fn agent_workspace() -> PathBuf {
     std::env::temp_dir()
 }
 
-fn build_acp_agent() -> Result<acp::AcpAgent> {
-    if let Ok(command) = std::env::var("CRUMB_ACP_AGENT_COMMAND") {
+pub fn test_settings(settings: &AppSettings) -> SettingsTestResult {
+    let settings = settings.clone().normalized();
+    if settings
+        .acp_agent_command()
+        .is_some_and(|command| command.trim_start().starts_with('{'))
+    {
+        return SettingsTestResult::ok("Custom ACP JSON is configured.");
+    }
+
+    let command = settings
+        .acp_agent_command()
+        .unwrap_or_else(|| format!("npx -y {DEFAULT_ACP_AGENT_PACKAGE}"));
+    let Some(executable) = first_executable(&command) else {
+        return SettingsTestResult::error("AI command is empty.");
+    };
+
+    match Command::new(&executable).arg("--version").output() {
+        Ok(output) if output.status.success() => SettingsTestResult::ok(format!(
+            "Found `{executable}`. Claude extraction command is locally launchable."
+        )),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("`{executable} --version` exited with {}", output.status)
+            } else {
+                stderr
+            };
+            SettingsTestResult::error(format!("Could not validate `{executable}`: {detail}"))
+        }
+        Err(e) => SettingsTestResult::error(format!(
+            "Could not launch `{executable}`. If Crumb is launched from Finder, configure an explicit ACP command path. {e}"
+        )),
+    }
+}
+
+fn build_acp_agent(settings: &AppSettings) -> Result<acp::AcpAgent> {
+    if let Some(command) = settings.acp_agent_command() {
         if command.trim_start().starts_with('{') {
             return acp::AcpAgent::from_str(&command)
-                .with_context(|| format!("parsing CRUMB_ACP_AGENT_COMMAND: {command}"));
+                .with_context(|| format!("parsing ACP command: {command}"));
         }
 
-        let command = format!("{} {command}", acp_agent_env_prefix())
+        let command = format!("{} {command}", acp_agent_env_prefix(settings))
             .trim()
             .to_string();
         return acp::AcpAgent::from_str(&command)
-            .with_context(|| format!("parsing CRUMB_ACP_AGENT_COMMAND: {command}"));
+            .with_context(|| format!("parsing ACP command: {command}"));
     }
 
-    let mut args = acp_agent_env_args();
+    let mut args = acp_agent_env_args(settings);
     args.extend(["npx".into(), "-y".into(), DEFAULT_ACP_AGENT_PACKAGE.into()]);
     acp::AcpAgent::from_args(args).context("building pinned Claude ACP command")
 }
 
-fn acp_agent_env_args() -> Vec<String> {
-    let model = crumb_ai_model();
-    let effort = crumb_ai_effort();
+fn acp_agent_env_args(settings: &AppSettings) -> Vec<String> {
+    let model = crumb_ai_model(settings);
+    let effort = crumb_ai_effort(settings);
     let mut env = vec![
         format!("ANTHROPIC_MODEL={model}"),
         format!("CLAUDE_CODE_EFFORT_LEVEL={effort}"),
@@ -239,14 +282,14 @@ fn acp_agent_env_args() -> Vec<String> {
         "DISABLE_TELEMETRY=1".into(),
         "MAX_THINKING_TOKENS=0".into(),
     ];
-    if let Some(config_dir) = crumb_claude_config_dir() {
+    if let Some(config_dir) = settings.claude_config_dir() {
         env.push(format!("CLAUDE_CONFIG_DIR={config_dir}"));
     }
     env
 }
 
-fn acp_agent_env_prefix() -> String {
-    acp_agent_env_args()
+fn acp_agent_env_prefix(settings: &AppSettings) -> String {
+    acp_agent_env_args(settings)
         .into_iter()
         .map(|assignment| shell_quote(&assignment))
         .collect::<Vec<_>>()
@@ -291,9 +334,9 @@ fn build_prompt(
     ))
 }
 
-fn acp_session_meta() -> Map<String, Value> {
-    let model = crumb_ai_model();
-    let effort = crumb_ai_effort();
+fn acp_session_meta(settings: &AppSettings) -> Map<String, Value> {
+    let model = crumb_ai_model(settings);
+    let effort = crumb_ai_effort(settings);
     let mut env = Map::new();
     env.insert("ANTHROPIC_MODEL".into(), Value::String(model.clone()));
     env.insert(
@@ -330,7 +373,7 @@ fn acp_session_meta() -> Map<String, Value> {
     );
     env.insert("DISABLE_TELEMETRY".into(), Value::String("1".into()));
     env.insert("MAX_THINKING_TOKENS".into(), Value::String("0".into()));
-    if let Some(config_dir) = crumb_claude_config_dir() {
+    if let Some(config_dir) = settings.claude_config_dir() {
         env.insert("CLAUDE_CONFIG_DIR".into(), Value::String(config_dir));
     }
 
@@ -371,33 +414,41 @@ fn acp_session_meta() -> Map<String, Value> {
     }
 }
 
-fn crumb_ai_model() -> String {
-    let requested = std::env::var("CRUMB_AI_MODEL").unwrap_or_else(|_| "sonnet".into());
+fn crumb_ai_model(settings: &AppSettings) -> String {
+    let requested = settings.ai_model.trim();
     let normalized = requested.trim().to_lowercase();
     if normalized.contains("sonnet") || normalized.contains("haiku") {
-        requested
+        requested.to_string()
     } else {
-        tracing::warn!("unsupported CRUMB_AI_MODEL={requested}; falling back to sonnet");
+        tracing::warn!("unsupported AI model setting {requested}; falling back to sonnet");
         "sonnet".into()
     }
 }
 
-fn crumb_ai_effort() -> String {
-    let requested = std::env::var("CRUMB_AI_EFFORT").unwrap_or_else(|_| "low".into());
+fn crumb_ai_effort(settings: &AppSettings) -> String {
+    let requested = settings.ai_effort.trim();
     let normalized = requested.trim().to_lowercase();
     if matches!(normalized.as_str(), "low" | "medium" | "high" | "xhigh") {
         normalized
     } else {
-        tracing::warn!("unsupported CRUMB_AI_EFFORT={requested}; falling back to low");
+        tracing::warn!("unsupported AI effort setting {requested}; falling back to low");
         "low".into()
     }
 }
 
-fn crumb_claude_config_dir() -> Option<String> {
-    std::env::var("CRUMB_CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn first_executable(command: &str) -> Option<String> {
+    command
+        .split_whitespace()
+        .map(|part| part.trim_matches('"').trim_matches('\''))
+        .find(|part| !part.is_empty() && !looks_like_env_assignment(part))
+        .map(ToOwned::to_owned)
+}
+
+fn looks_like_env_assignment(part: &str) -> bool {
+    let Some((key, _)) = part.split_once('=') else {
+        return false;
+    };
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[derive(Serialize)]

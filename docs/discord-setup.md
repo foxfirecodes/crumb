@@ -54,7 +54,7 @@ This is the new (post–2024) Discord feature that lets a slash command run anyw
 1. Go to the **Bot** tab in the sidebar.
 2. Under **Privileged Gateway Intents**, enable:
    - No privileged intents are required for the MVP. The bot only receives slash-command interactions; message history is read separately with your user token.
-3. Under **Token**, click **Reset Token** and copy the value once. This is your `DISCORD_BOT_TOKEN`. **Discord shows this exactly once.** Save it immediately into your `.env`.
+3. Under **Token**, click **Reset Token** and copy the value once. This is your bot token. **Discord shows this exactly once.** Save it immediately into Crumb's Settings window.
 
 ### 1.4 Public key (informational)
 
@@ -80,7 +80,7 @@ On the General Information page there's also a **Public Key**. We don't need it 
 3. Go to the **Network** tab. Make sure **Preserve log** is on.
 4. Refresh the page (`Cmd+R`).
 5. In the Network filter box, type `science` or `users/@me`. Click any matching request.
-6. In the right pane, switch to **Headers**. Scroll to **Request Headers** and find the `Authorization` header. Its value is your user token. Copy it verbatim into `DISCORD_USER_TOKEN` in your `.env`.
+6. In the right pane, switch to **Headers**. Scroll to **Request Headers** and find the `Authorization` header. Its value is your user token. Copy it verbatim into Crumb's Settings window.
 
 > The Discord desktop app obfuscates this — use the web app or a real browser tab inside the desktop client's devtools.
 
@@ -90,38 +90,26 @@ If you ever change your Discord password, this token is invalidated and you'll n
 
 ---
 
-## Part 3 — Populate `.env`
+## Part 3 — Populate Settings
 
-In the repo root:
+Open **Settings...** from Crumb's tray menu and enter:
 
-```
-DISCORD_APP_ID=000000000000000000
-DISCORD_BOT_TOKEN=…
-DISCORD_USER_TOKEN=…
-```
+- Application ID
+- Bot token
+- User token
 
 > **No `ANTHROPIC_API_KEY` needed.** Crumb is an ACP client. By default it connects to Claude Code through the pinned command `npx -y @agentclientprotocol/claude-agent-acp@0.33.1`, which reuses your existing Claude Code auth.
 
 Optional AI settings:
 
-```
-# Defaults to sonnet. Only sonnet/haiku model names are accepted.
-CRUMB_AI_MODEL=sonnet
+- Model: `sonnet` or `haiku`
+- Effort: `low`, `medium`, `high`, or `xhigh`
+- Claude config dir: optional path to a separate Claude config/auth directory
+- ACP command: optional alternate ACP-compatible agent command
 
-# Defaults to low for fast extraction. Use medium if dedupe quality drops.
-CRUMB_AI_EFFORT=low
+Crumb passes Claude Code session options and environment variables to use the configured model/effort and disable project/user setting sources, hooks, tools, prompt history, and memory for extraction sessions. By default it does not override `CLAUDE_CONFIG_DIR`, so the ACP connector can reuse your normal Claude Code auth. If you set a Claude config dir, that directory must already be logged into Claude Code.
 
-# Optional: point Crumb at a fully separate Claude config/auth directory.
-# If you set this, that directory needs its own Claude auth.
-CRUMB_CLAUDE_CONFIG_DIR=/path/to/crumb-claude-config
-
-# Optional: point at another ACP-compatible agent command.
-CRUMB_ACP_AGENT_COMMAND="npx -y @agentclientprotocol/claude-agent-acp@0.33.1"
-```
-
-Crumb passes Claude Code session options and environment variables to use the configured model/effort and disable project/user setting sources, hooks, tools, prompt history, and memory for extraction sessions. By default it does not override `CLAUDE_CONFIG_DIR`, so the ACP connector can reuse your normal Claude Code auth. If you set `CRUMB_CLAUDE_CONFIG_DIR`, that directory must already be logged into Claude Code.
-
-Make sure `.env` is gitignored before you put real values in. Crumb will refuse to start if any Discord vars are missing or look obviously malformed.
+For developer builds, Crumb can import a repo-root `.env` once if no app settings file exists. Normal bundled use does not require `.env`.
 
 ---
 

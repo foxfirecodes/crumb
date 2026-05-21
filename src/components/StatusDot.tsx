@@ -2,6 +2,7 @@ import type { SidecarStatus } from "../lib/types";
 
 const COLOR: Record<SidecarStatus["kind"], string> = {
   starting: "#9ca3af",
+  needssetup: "#f59e0b",
   connected: "#10b981",
   disconnected: "#f59e0b",
   error: "#ef4444",
@@ -9,6 +10,7 @@ const COLOR: Record<SidecarStatus["kind"], string> = {
 
 const LABEL: Record<SidecarStatus["kind"], string> = {
   starting: "starting",
+  needssetup: "setup",
   connected: "connected",
   disconnected: "disconnected",
   error: "error",
@@ -18,6 +20,8 @@ export function StatusDot({ status }: { status: SidecarStatus }) {
   const title =
     status.kind === "error"
       ? `error: ${status.message}`
+      : status.kind === "needssetup"
+        ? `setup needed: ${status.missing.join(", ")}`
       : status.kind === "connected"
         ? `connected${status.botUser ? ` as ${status.botUser}` : ""}`
         : LABEL[status.kind];

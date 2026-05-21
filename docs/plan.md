@@ -35,21 +35,15 @@ src-tauri/src/
 ├── discord.rs     Discord gateway, interactions, and REST scraper
 ├── runtime.rs     app runtime orchestration
 ├── db.rs          SQLite persistence
-├── env.rs         .env loading
+├── settings.rs    app settings loading and legacy .env import
 ├── events.rs      Tauri event payloads
 ├── commands.rs    frontend invoke handlers
 └── lib.rs         Tauri setup, tray, popover lifecycle
 ```
 
-## Environment
+## Settings
 
-`.env` in the repo root for dev:
-
-```bash
-DISCORD_APP_ID=000000000000000000
-DISCORD_BOT_TOKEN=...
-DISCORD_USER_TOKEN=...
-```
+Crumb stores Discord and AI settings in app data as `settings.json`. Developer builds can import a repo-root `.env` once when no app settings file exists, but bundled app usage is settings-window driven.
 
 AI auth is handled by the Claude Code ACP connector. By default Crumb pins the connector version and spawns:
 
@@ -57,13 +51,7 @@ AI auth is handled by the Claude Code ACP connector. By default Crumb pins the c
 npx -y @agentclientprotocol/claude-agent-acp@0.33.1
 ```
 
-Override that with:
-
-```bash
-CRUMB_ACP_AGENT_COMMAND="npx -y @agentclientprotocol/claude-agent-acp@0.33.1"
-```
-
-or any other ACP-compatible agent command. Crumb passes ACP session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. It reuses normal Claude Code auth by default. Set `CRUMB_AI_MODEL=haiku` to use Haiku, `CRUMB_AI_EFFORT=medium` to trade speed for quality, or `CRUMB_CLAUDE_CONFIG_DIR=/path/to/config` if you want Crumb to use a completely separate Claude config/auth directory that has already been authenticated.
+The settings window can override the ACP command with any other ACP-compatible agent command. Crumb passes ACP session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. It reuses normal Claude Code auth by default, unless a separate Claude config directory is configured.
 
 ## /scrape Flow
 

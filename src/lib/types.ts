@@ -74,6 +74,22 @@ export interface ScrapeDetail {
 
 export type SidecarStatus =
   | { kind: "starting" }
+  | { kind: "needssetup"; missing: string[] }
   | { kind: "connected"; botUser: string | null; selfUser: string | null }
   | { kind: "disconnected" }
   | { kind: "error"; message: string };
+
+export interface AppSettings {
+  discordAppId: string;
+  discordBotToken: string;
+  discordUserToken: string;
+  aiModel: string;
+  aiEffort: string;
+  claudeConfigDir: string;
+  acpAgentCommand: string;
+}
+
+export interface SettingsTestResult {
+  ok: boolean;
+  message: string;
+}

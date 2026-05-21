@@ -125,6 +125,35 @@ impl DiscordBot {
         Ok(())
     }
 
+    pub async fn test_credentials(&self) -> Result<Option<String>> {
+        let response = self
+            .http
+            .get(format!("{DISCORD_API}/users/@me"))
+            .header(AUTHORIZATION, bot_auth(&self.token))
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .send()
+            .await
+            .context("checking Discord bot token")?;
+        let user: ApiUser = parse_json_response(response)
+            .await
+            .context("Discord bot token rejected")?;
+        let response = self
+            .http
+            .get(format!(
+                "{DISCORD_API}/applications/{}/commands",
+                self.app_id
+            ))
+            .header(AUTHORIZATION, bot_auth(&self.token))
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .send()
+            .await
+            .context("checking Discord application commands")?;
+        let _: Value = parse_json_response(response)
+            .await
+            .context("Discord application ID and bot token did not match")?;
+        Ok(Some(normalize_person(&user).display_name))
+    }
+
     pub async fn run(
         self,
         command_tx: mpsc::UnboundedSender<DiscordCommand>,
