@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "app:install": "tauri build && rm -rf /Applications/Crumb.app && ditto src-tauri/target/release/bundle/macos/Crumb.app /Applications/Crumb.app"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

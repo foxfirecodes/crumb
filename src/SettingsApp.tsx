@@ -190,7 +190,7 @@ export default function SettingsApp() {
             <input
               value={settings.acpAgentCommand}
               onChange={(e) => update("acpAgentCommand", e.target.value)}
-              placeholder="npx -y @agentclientprotocol/claude-agent-acp@0.33.1"
+              placeholder="bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'"
             />
           </label>
           <button

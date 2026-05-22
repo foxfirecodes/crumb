@@ -18,7 +18,8 @@ use crate::discord::{NormalizedMessage, NormalizedPerson};
 use crate::events::{CanonicalActionItem, Decision};
 use crate::settings::{AppSettings, SettingsTestResult};
 
-const DEFAULT_ACP_AGENT_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.33.1";
+const DEFAULT_ACP_AGENT_COMMAND: &str =
+    "bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'";
 
 const SYSTEM_PROMPT: &str = r#"You are an extraction and reconciliation specialist. You receive a chronological transcript of Discord messages from a single source plus existing records Crumb already knows about from that source. Your job is to identify:
 
@@ -223,7 +224,7 @@ pub fn test_settings(settings: &AppSettings) -> SettingsTestResult {
 
     let command = settings
         .acp_agent_command()
-        .unwrap_or_else(|| format!("npx -y {DEFAULT_ACP_AGENT_PACKAGE}"));
+        .unwrap_or_else(|| DEFAULT_ACP_AGENT_COMMAND.to_string());
     let Some(executable) = first_executable(&command) else {
         return SettingsTestResult::error("AI command is empty.");
     };
@@ -248,22 +249,18 @@ pub fn test_settings(settings: &AppSettings) -> SettingsTestResult {
 }
 
 fn build_acp_agent(settings: &AppSettings) -> Result<acp::AcpAgent> {
-    if let Some(command) = settings.acp_agent_command() {
-        if command.trim_start().starts_with('{') {
-            return acp::AcpAgent::from_str(&command)
-                .with_context(|| format!("parsing ACP command: {command}"));
-        }
-
-        let command = format!("{} {command}", acp_agent_env_prefix(settings))
-            .trim()
-            .to_string();
+    let command = settings
+        .acp_agent_command()
+        .unwrap_or_else(|| DEFAULT_ACP_AGENT_COMMAND.to_string());
+    if command.trim_start().starts_with('{') {
         return acp::AcpAgent::from_str(&command)
             .with_context(|| format!("parsing ACP command: {command}"));
     }
 
-    let mut args = acp_agent_env_args(settings);
-    args.extend(["npx".into(), "-y".into(), DEFAULT_ACP_AGENT_PACKAGE.into()]);
-    acp::AcpAgent::from_args(args).context("building pinned Claude ACP command")
+    let command = format!("{} {command}", acp_agent_env_prefix(settings))
+        .trim()
+        .to_string();
+    acp::AcpAgent::from_str(&command).with_context(|| format!("parsing ACP command: {command}"))
 }
 
 fn acp_agent_env_args(settings: &AppSettings) -> Vec<String> {

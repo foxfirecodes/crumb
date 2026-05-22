@@ -48,7 +48,7 @@ Crumb stores Discord and AI settings in app data as `settings.json`. Developer b
 AI auth is handled by the Claude Code ACP connector. By default Crumb pins the connector version and spawns:
 
 ```bash
-npx -y @agentclientprotocol/claude-agent-acp@0.33.1
+bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'
 ```
 
 The settings window can override the ACP command with any other ACP-compatible agent command. Crumb passes ACP session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. It reuses normal Claude Code auth by default, unless a separate Claude config directory is configured.

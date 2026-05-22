@@ -76,13 +76,13 @@ Crumb currently runs as a local developer app. You will need:
 1. Install dependencies:
 
 ```bash
-npm install
+bun install
 ```
 
 2. Run the app:
 
 ```bash
-npm run tauri:dev
+bun run tauri:dev
 ```
 
 3. Open **Settings...** from the tray menu and fill in your Discord application ID, bot token, and user token.
@@ -95,19 +95,19 @@ For the full Discord app/token walkthrough, read [docs/discord-setup.md](docs/di
 
 ## Installing The App Bundle
 
-Build a raw macOS app bundle:
+Build a raw macOS app bundle and install it to `/Applications`:
 
 ```bash
-npm run tauri:build
+bun run app:install
 ```
 
-Then copy `src-tauri/target/release/bundle/macos/Crumb.app` into `/Applications` and launch it from Finder. Crumb stores settings in the app data directory and no longer needs a repo-local `.env` file for normal use.
+The script replaces an existing `/Applications/Crumb.app` if one is present. Crumb stores settings in the app data directory and no longer needs a repo-local `.env` file for normal use.
 
 ## Useful Commands
 
 ```bash
-npm run tauri:dev   # run the menu bar app locally
-npm run build       # typecheck and build the frontend
+bun run tauri:dev   # run the menu bar app locally
+bun run build       # typecheck and build the frontend
 cargo test          # run Rust tests from src-tauri/
 ```
 

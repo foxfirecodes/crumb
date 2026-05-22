@@ -98,7 +98,7 @@ Open **Settings...** from Crumb's tray menu and enter:
 - Bot token
 - User token
 
-> **No `ANTHROPIC_API_KEY` needed.** Crumb is an ACP client. By default it connects to Claude Code through the pinned command `npx -y @agentclientprotocol/claude-agent-acp@0.33.1`, which reuses your existing Claude Code auth.
+> **No `ANTHROPIC_API_KEY` needed.** Crumb is an ACP client. By default it connects to Claude Code through the pinned command `bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'`, which reuses your existing Claude Code auth.
 
 Optional AI settings:
 
