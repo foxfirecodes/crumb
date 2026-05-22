@@ -12,6 +12,7 @@
     "core:window:allow-set-focus",
     "core:webview:allow-set-webview-focus",
     "opener:default",
+    "notification:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled"
