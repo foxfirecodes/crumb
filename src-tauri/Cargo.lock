@@ -672,6 +672,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures-util",
+ "objc2",
+ "objc2-app-kit",
  "parking_lot",
  "reqwest 0.12.28",
  "rusqlite",

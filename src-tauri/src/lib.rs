@@ -18,6 +18,10 @@ use tauri::{
 };
 use tracing_subscriber::EnvFilter;
 
+const POPOVER_WIDTH: f64 = 380.0;
+const POPOVER_HEIGHT: f64 = 520.0;
+const POPOVER_TRAY_GAP: f64 = 4.0;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -131,7 +135,7 @@ pub fn run() {
 
 fn toggle_popover(
     app: &AppHandle,
-    click_pos: PhysicalPosition<f64>,
+    _click_pos: PhysicalPosition<f64>,
     rect: Rect,
 ) -> tauri::Result<()> {
     let Some(win) = app.get_webview_window("popover") else {
@@ -142,35 +146,79 @@ fn toggle_popover(
         return Ok(());
     }
 
-    let scale = win.scale_factor().unwrap_or(1.0);
-    let win_size = win
-        .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(380, 520));
-
-    // Both fields of Rect are enums (Position::Physical | Logical, Size::*).
-    // Normalize to physical pixels.
-    let (icon_x, icon_y) = match rect.position {
-        Position::Physical(p) => (p.x as f64, p.y as f64),
-        Position::Logical(p) => (p.x * scale, p.y * scale),
-    };
-    let (icon_w, icon_h) = match rect.size {
-        Size::Physical(s) => (s.width as f64, s.height as f64),
-        Size::Logical(s) => (s.width * scale, s.height * scale),
-    };
+    // The tray rect is reported in physical pixels using the tray item's display scale.
+    // The hidden popover may still have the scale factor from a previous monitor.
+    let scale = tray_event_scale_factor(win.scale_factor().unwrap_or(1.0));
+    let (icon_x, icon_y) = rect_position_to_logical(rect.position, scale);
+    let (icon_w, icon_h) = rect_size_to_logical(rect.size, scale);
 
     let icon_center_x = icon_x + icon_w / 2.0;
     let icon_bottom_y = icon_y + icon_h;
-    let _ = click_pos; // rect is more reliable than cursor position.
 
-    let target_x = icon_center_x - (win_size.width as f64 / 2.0);
-    let target_y = icon_bottom_y + 4.0;
+    let target_x = icon_center_x - POPOVER_WIDTH / 2.0;
+    let target_y = icon_bottom_y + POPOVER_TRAY_GAP;
 
-    let logical = LogicalPosition::new(target_x / scale, target_y / scale);
-    win.set_size(LogicalSize::new(380.0, 520.0))?;
+    let logical = LogicalPosition::new(target_x, target_y);
+    win.set_size(LogicalSize::new(POPOVER_WIDTH, POPOVER_HEIGHT))?;
     win.set_position(logical)?;
     win.show()?;
     win.set_focus()?;
     Ok(())
+}
+
+fn tray_event_scale_factor(fallback_scale: f64) -> f64 {
+    current_mouse_screen_scale_factor().unwrap_or_else(|| normalized_scale(fallback_scale))
+}
+
+fn rect_position_to_logical(position: Position, scale: f64) -> (f64, f64) {
+    let scale = normalized_scale(scale);
+    match position {
+        Position::Physical(p) => (p.x as f64 / scale, p.y as f64 / scale),
+        Position::Logical(p) => (p.x, p.y),
+    }
+}
+
+fn rect_size_to_logical(size: Size, scale: f64) -> (f64, f64) {
+    let scale = normalized_scale(scale);
+    match size {
+        Size::Physical(s) => (s.width as f64 / scale, s.height as f64 / scale),
+        Size::Logical(s) => (s.width, s.height),
+    }
+}
+
+fn normalized_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn current_mouse_screen_scale_factor() -> Option<f64> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSEvent, NSScreen};
+
+    let mtm = MainThreadMarker::new()?;
+    let mouse = NSEvent::mouseLocation();
+    let screens = NSScreen::screens(mtm);
+
+    for screen in screens.iter() {
+        let frame = screen.frame();
+        let contains_x = mouse.x >= frame.origin.x && mouse.x < frame.origin.x + frame.size.width;
+        let contains_y = mouse.y >= frame.origin.y && mouse.y < frame.origin.y + frame.size.height;
+
+        if contains_x && contains_y {
+            return Some(normalized_scale(screen.backingScaleFactor()));
+        }
+    }
+
+    NSScreen::mainScreen(mtm).map(|screen| normalized_scale(screen.backingScaleFactor()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_mouse_screen_scale_factor() -> Option<f64> {
+    None
 }
 
 fn show_popover_centered(app: &AppHandle) -> tauri::Result<()> {
