@@ -125,6 +125,9 @@ pub fn run() {
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::CloseRequested { .. }) {
                 let _ = window.hide();
+                if window.label() == "settings" {
+                    let _ = hide_app_from_dock_and_switcher(window.app_handle());
+                }
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                 }
@@ -236,9 +239,35 @@ pub fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
     let Some(win) = app.get_webview_window("settings") else {
         return Ok(());
     };
+    show_app_in_dock_and_switcher(app)?;
     win.center()?;
     win.show()?;
     win.set_focus()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn show_app_in_dock_and_switcher(app: &AppHandle) -> tauri::Result<()> {
+    app.set_activation_policy(tauri::ActivationPolicy::Regular)?;
+    app.set_dock_visibility(true)?;
+    app.show()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_app_in_dock_and_switcher(_app: &AppHandle) -> tauri::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn hide_app_from_dock_and_switcher(app: &AppHandle) -> tauri::Result<()> {
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+    app.set_dock_visibility(false)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_app_from_dock_and_switcher(_app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
