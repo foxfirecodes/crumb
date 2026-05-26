@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval_at, sleep, Instant, MissedTickBehavior};
@@ -52,6 +53,8 @@ pub struct ScrapeRequest {
     pub guild_name: Option<String>,
     pub triggered_by: String,
     pub limit: usize,
+    pub target_message_id: Option<String>,
+    pub target_message: Option<NormalizedMessage>,
     pub reply: InteractionReply,
 }
 
@@ -312,14 +315,14 @@ impl DiscordBot {
                 if interaction.kind != 2
                     || !matches!(
                         interaction.data.name.as_str(),
-                        "scrape" | "watch" | "unwatch"
+                        "scrape" | "watch" | "unwatch" | "Add action item"
                     )
                 {
                     return Ok(());
                 }
 
                 if let Err(e) = self.defer_reply(&interaction).await {
-                    tracing::warn!("failed to defer /scrape reply: {e}");
+                    tracing::warn!("failed to defer Discord command reply: {e}");
                 }
 
                 let user = interaction
@@ -369,6 +372,38 @@ impl DiscordBot {
                             guild_name,
                             triggered_by: user,
                             limit,
+                            target_message_id: None,
+                            target_message: None,
+                            reply,
+                        })
+                    }
+                    "Add action item" => {
+                        if interaction.data.kind != Some(3) {
+                            return Ok(());
+                        }
+                        let Some(target_message_id) = interaction.data.target_id.clone() else {
+                            let _ = reply
+                                .send("Add action item failed: Discord did not include a target message.")
+                                .await;
+                            return Ok(());
+                        };
+                        let target_message = interaction
+                            .data
+                            .resolved
+                            .as_ref()
+                            .and_then(|resolved| resolved.messages.get(&target_message_id))
+                            .cloned()
+                            .map(Into::into);
+                        DiscordCommand::Scrape(ScrapeRequest {
+                            scrape_id: format!("discord:{channel_id}"),
+                            channel_id,
+                            channel_name,
+                            guild_id,
+                            guild_name,
+                            triggered_by: user,
+                            limit: 1,
+                            target_message_id: Some(target_message_id),
+                            target_message,
                             reply,
                         })
                     }
@@ -461,6 +496,12 @@ fn application_command_definitions() -> Value {
             "contexts": [0, 1, 2]
         },
         {
+            "type": 3,
+            "name": "Add action item",
+            "integration_types": [1, 0],
+            "contexts": [0, 1, 2]
+        },
+        {
             "type": 1,
             "name": "watch",
             "description": "Watch this channel for new action items every few minutes.",
@@ -493,6 +534,7 @@ fn comparable_application_commands(value: &Value) -> Option<Vec<Value>> {
 
 fn comparable_application_command(command: &Value) -> Option<Value> {
     let object = command.as_object()?;
+    let kind = object.get("type").and_then(Value::as_i64).unwrap_or(1);
     let mut options = object
         .get("options")
         .and_then(Value::as_array)
@@ -508,7 +550,11 @@ fn comparable_application_command(command: &Value) -> Option<Value> {
     Some(json!({
         "type": object.get("type").cloned().unwrap_or(Value::Null),
         "name": object.get("name").cloned().unwrap_or(Value::Null),
-        "description": object.get("description").cloned().unwrap_or(Value::Null),
+        "description": if kind == 1 {
+            object.get("description").cloned().unwrap_or(Value::Null)
+        } else {
+            Value::String(String::new())
+        },
         "integration_types": sorted_values(object.get("integration_types")),
         "contexts": sorted_values(object.get("contexts")),
         "options": options
@@ -742,6 +788,42 @@ impl DiscordScraper {
         on_progress(messages.len());
         Ok(messages)
     }
+
+    pub async fn fetch_channel_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<NormalizedMessage> {
+        let url = format!("{DISCORD_API}/channels/{channel_id}/messages/{message_id}");
+        let mut attempts = 0;
+        let message: ApiMessage = loop {
+            attempts += 1;
+            let response = self
+                .http
+                .get(&url)
+                .header(AUTHORIZATION, self.token.as_str())
+                .header(USER_AGENT, USER_AGENT_VALUE)
+                .send()
+                .await
+                .context("fetching Discord message")?;
+
+            if response.status().as_u16() == 429 {
+                let retry: RateLimit = response
+                    .json()
+                    .await
+                    .context("parsing Discord rate limit")?;
+                if attempts >= 3 {
+                    bail!("Discord rate limited request; retry the scrape in a moment");
+                }
+                sleep(Duration::from_secs_f64(retry.retry_after.max(0.25))).await;
+                continue;
+            }
+
+            break parse_json_response(response).await?;
+        };
+
+        Ok(message.into())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -787,15 +869,28 @@ struct InteractionCreate {
 
 #[derive(Debug, Deserialize)]
 struct InteractionData {
+    #[serde(rename = "type")]
+    #[serde(default)]
+    kind: Option<u64>,
     name: String,
     #[serde(default)]
     options: Vec<InteractionOption>,
+    #[serde(default)]
+    target_id: Option<String>,
+    #[serde(default)]
+    resolved: Option<ResolvedData>,
 }
 
 #[derive(Debug, Deserialize)]
 struct InteractionOption {
     name: String,
     value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedData {
+    #[serde(default)]
+    messages: HashMap<String, ApiMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -819,7 +914,7 @@ struct InteractionMember {
     user: ApiUser,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ApiUser {
     id: String,
     username: String,
@@ -829,7 +924,7 @@ struct ApiUser {
     global_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ApiMessage {
     id: String,
     author: ApiUser,
@@ -848,13 +943,13 @@ struct ApiMessage {
     mentions: Vec<ApiUser>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct MessageReference {
     #[serde(default)]
     message_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ApiAttachment {
     url: String,
 }

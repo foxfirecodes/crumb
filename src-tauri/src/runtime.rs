@@ -326,27 +326,39 @@ async fn do_scrape(
     let current_user = scraper.self_user();
 
     let result = async {
-        let scraped_range = db
-            .scraped_message_range(&req.scrape_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to load scrape range: {e}");
-                Default::default()
-            });
-        let messages = scraper
-            .fetch_channel_messages(&req.channel_id, req.limit, |fetched| {
-                tracing::debug!("progress {}: {}", req.scrape_id, fetched);
-            })
-            .await?;
-        let messages = messages
-            .into_iter()
-            .filter(|message| {
-                is_outside_scraped_range(
-                    message,
-                    scraped_range.first_message_id.as_deref(),
-                    scraped_range.last_message_id.as_deref(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let is_targeted_message = req.target_message_id.is_some();
+        let messages = if let Some(target_message_id) = req.target_message_id.as_deref() {
+            let message = match req.target_message.clone() {
+                Some(message) => message,
+                None => {
+                    scraper
+                        .fetch_channel_message(&req.channel_id, target_message_id)
+                        .await?
+                }
+            };
+            vec![message]
+        } else {
+            let scraped_range = db
+                .scraped_message_range(&req.scrape_id)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("failed to load scrape range: {e}");
+                    Default::default()
+                });
+            scraper
+                .fetch_channel_messages(&req.channel_id, req.limit, |fetched| {
+                    tracing::debug!("progress {}: {}", req.scrape_id, fetched);
+                })
+                .await?
+                .into_iter()
+                .filter(|message| {
+                    is_outside_scraped_range(
+                        message,
+                        scraped_range.first_message_id.as_deref(),
+                        scraped_range.last_message_id.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
 
         let _ = req
             .reply
@@ -365,6 +377,7 @@ async fn do_scrape(
             &req.channel_id,
             &messages,
             &settings,
+            !is_targeted_message,
         )
         .await
         .context("extraction failed")
@@ -524,6 +537,7 @@ async fn do_watch_poll(
             &channel.channel_id,
             &messages,
             &settings,
+            true,
         )
         .await?;
         db.update_watch_cursor(
@@ -566,6 +580,7 @@ async fn extract_and_store(
     channel_id: &str,
     messages: &[NormalizedMessage],
     settings: &AppSettings,
+    update_message_range: bool,
 ) -> Result<ExtractionOutcome> {
     let existing_actions = db.list_source_actions("discord", channel_id)?;
     let existing_action_ids = existing_actions
@@ -623,8 +638,12 @@ async fn extract_and_store(
 
     let updated = db.mark_extracted(
         scrape_id,
-        messages.first().map(|message| message.id.as_str()),
-        messages.last().map(|message| message.id.as_str()),
+        update_message_range
+            .then(|| messages.first().map(|message| message.id.as_str()))
+            .flatten(),
+        update_message_range
+            .then(|| messages.last().map(|message| message.id.as_str()))
+            .flatten(),
         messages.len() as i64,
         &extracted.summary,
         &decisions,
