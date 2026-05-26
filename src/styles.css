@@ -175,9 +175,9 @@ body {
   color: var(--fg);
 }
 
-.actions__person {
+.actions__person,
+.actions__sort {
   min-width: 0;
-  flex: 1;
   height: 30px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -185,6 +185,15 @@ body {
   color: var(--fg-dim);
   font: inherit;
   font-size: 11px;
+}
+
+.actions__person {
+  flex: 1 1 auto;
+}
+
+.actions__sort {
+  flex: 0 0 82px;
+  padding: 0 4px;
 }
 
 .action-list {

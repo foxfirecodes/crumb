@@ -55,9 +55,10 @@ pub async fn open_action_source_in_discord(
 #[tauri::command]
 pub fn list_action_items(
     status_filter: String,
+    sort: Option<String>,
     db: State<'_, Db>,
 ) -> Result<Vec<CanonicalActionItem>, String> {
-    db.list_action_items(&status_filter)
+    db.list_action_items_sorted(&status_filter, sort.as_deref().unwrap_or("newest"))
         .map_err(|e| e.to_string())
 }
 

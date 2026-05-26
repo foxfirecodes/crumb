@@ -65,6 +65,7 @@ export interface CanonicalActionItem {
 }
 
 export type ActionItemStatusFilter = "open" | "dismissed" | "all";
+export type ActionItemSort = "newest" | "due";
 
 export interface ScrapeDetail {
   scrape: ScrapeSummary;

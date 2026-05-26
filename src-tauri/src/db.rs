@@ -148,6 +148,14 @@ impl Db {
     }
 
     pub fn list_action_items(&self, status_filter: &str) -> Result<Vec<CanonicalActionItem>> {
+        self.list_action_items_sorted(status_filter, "newest")
+    }
+
+    pub fn list_action_items_sorted(
+        &self,
+        status_filter: &str,
+        sort: &str,
+    ) -> Result<Vec<CanonicalActionItem>> {
         let status_clause = match status_filter {
             "open" => {
                 "a.status IN ('inbox', 'active')
@@ -161,14 +169,25 @@ impl Db {
             }
             other => bail!("invalid action item status filter: {other}"),
         };
-        let order_clause = match status_filter {
-            "dismissed" => "COALESCE(a.completed_at, a.last_seen_at) DESC, a.last_seen_at DESC",
-            _ => {
-                "CASE WHEN a.due IS NULL OR a.due = '' THEN 1 ELSE 0 END,
+
+        if !matches!(sort, "newest" | "due") {
+            bail!("invalid action item sort: {sort}");
+        }
+
+        let order_clause = if status_filter == "dismissed" {
+            "COALESCE(a.completed_at, a.last_seen_at) DESC, a.last_seen_at DESC"
+        } else {
+            match sort {
+                "newest" => "a.first_seen_at DESC, a.last_seen_at DESC, a.id DESC",
+                "due" => {
+                    "CASE WHEN a.due IS NULL OR a.due = '' THEN 1 ELSE 0 END,
                  a.due,
                  a.priority DESC,
                  a.relevance_score DESC,
-                 a.last_seen_at DESC"
+                 a.last_seen_at DESC,
+                 a.first_seen_at DESC"
+                }
+                _ => unreachable!("sort was validated above"),
             }
         };
 
@@ -2187,6 +2206,79 @@ mod tests {
         assert_eq!(actions[0].id, action_id);
         assert_eq!(actions[0].status, "inbox");
         assert_eq!(actions[0].completed_at, None);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_action_items_can_sort_by_newest_or_due() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-action-sort-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "scrape-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "scrape-1",
+            Some("message-1"),
+            Some("message-2"),
+            2,
+            "summary",
+            &[],
+            &[
+                ActionCandidate {
+                    text: "File launch paperwork".into(),
+                    assignee_key: None,
+                    assignee: None,
+                    due: Some("today".into()),
+                    url: None,
+                    message_ids: vec!["message-1".into()],
+                    dedupe_key: Some("file-launch-paperwork".into()),
+                    merge_with: None,
+                },
+                ActionCandidate {
+                    text: "Review webhook logs".into(),
+                    assignee_key: None,
+                    assignee: None,
+                    due: None,
+                    url: None,
+                    message_ids: vec!["message-2".into()],
+                    dedupe_key: Some("review-webhook-logs".into()),
+                    merge_with: None,
+                },
+            ],
+        )?;
+
+        {
+            let conn = db.inner.lock();
+            conn.execute(
+                "UPDATE canonical_action_items
+                 SET first_seen_at = ?, last_seen_at = ?, due = ?
+                 WHERE title = ?",
+                rusqlite::params![1_000_i64, 1_000_i64, "today", "File launch paperwork"],
+            )?;
+            conn.execute(
+                "UPDATE canonical_action_items
+                 SET first_seen_at = ?, last_seen_at = ?, due = NULL
+                 WHERE title = ?",
+                rusqlite::params![2_000_i64, 2_000_i64, "Review webhook logs"],
+            )?;
+        }
+
+        let newest = db.list_open_action_items()?;
+        assert_eq!(newest[0].title, "Review webhook logs");
+        assert_eq!(newest[1].title, "File launch paperwork");
+
+        let due = db.list_action_items_sorted("open", "due")?;
+        assert_eq!(due[0].title, "File launch paperwork");
+        assert_eq!(due[1].title, "Review webhook logs");
+        assert!(db.list_action_items_sorted("open", "bogus").is_err());
 
         let _ = std::fs::remove_file(db_path);
         Ok(())

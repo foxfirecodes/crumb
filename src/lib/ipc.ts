@@ -4,6 +4,7 @@ import type {
   CanonicalActionItem,
   CanonicalActionStatus,
   ActionItemStatusFilter,
+  ActionItemSort,
   ScrapeDetail,
   ScrapeSummary,
   SidecarStatus,
@@ -18,8 +19,10 @@ export const deleteSource = (id: string) =>
   invoke<void>("delete_source", { id });
 export const openActionSourceInDiscord = (id: string) =>
   invoke<void>("open_action_source_in_discord", { id });
-export const listActionItems = (statusFilter: ActionItemStatusFilter) =>
-  invoke<CanonicalActionItem[]>("list_action_items", { statusFilter });
+export const listActionItems = (
+  statusFilter: ActionItemStatusFilter,
+  sort: ActionItemSort,
+) => invoke<CanonicalActionItem[]>("list_action_items", { statusFilter, sort });
 export const setActionItemStatus = (
   id: string,
   status: CanonicalActionStatus,

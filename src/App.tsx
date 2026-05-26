@@ -18,6 +18,7 @@ import {
 import type {
   CanonicalActionItem,
   ActionItemStatusFilter,
+  ActionItemSort,
   ScrapeDetail,
   ScrapeSummary,
   SidecarStatus,
@@ -39,6 +40,7 @@ export default function App() {
   const [view, setView] = useState<View>("actions");
   const [actionStatusFilter, setActionStatusFilter] =
     useState<ActionItemStatusFilter>("open");
+  const [actionSort, setActionSort] = useState<ActionItemSort>("newest");
   const [storedPersonFilter, setStoredPersonFilter] =
     useState<StoredPersonFilter>(readStoredPersonFilter);
   const [actions, setActions] = useState<CanonicalActionItem[]>([]);
@@ -48,9 +50,13 @@ export default function App() {
   const [detail, setDetail] = useState<ScrapeDetail | null>(null);
   const [status, setStatus] = useState<SidecarStatus>({ kind: "starting" });
   const personFilter = storedPersonFilter.key;
+  const actionSortForStatus =
+    actionStatusFilter === "dismissed" ? "newest" : actionSort;
 
   useEffect(() => {
-    listActionItems(actionStatusFilter).then(setActions).catch(console.error);
+    listActionItems(actionStatusFilter, actionSortForStatus)
+      .then(setActions)
+      .catch(console.error);
     listScrapes().then(setScrapes).catch(console.error);
     getSidecarStatus().then(setStatus).catch(console.error);
 
@@ -62,10 +68,14 @@ export default function App() {
       setDetail((prev) =>
         prev && prev.scrape.id === s.id ? { ...prev, scrape: s } : prev,
       );
-      listActionItems(actionStatusFilter).then(setActions).catch(console.error);
+      listActionItems(actionStatusFilter, actionSortForStatus)
+        .then(setActions)
+        .catch(console.error);
     });
     const unlistenActions = onActionsUpdated(() => {
-      listActionItems(actionStatusFilter).then(setActions).catch(console.error);
+      listActionItems(actionStatusFilter, actionSortForStatus)
+        .then(setActions)
+        .catch(console.error);
     });
     const unlistenStatus = onSidecarStatus(setStatus);
 
@@ -75,7 +85,7 @@ export default function App() {
       unlistenActions.then((fn) => fn());
       unlistenStatus.then((fn) => fn());
     };
-  }, [actionStatusFilter]);
+  }, [actionStatusFilter, actionSortForStatus]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -125,7 +135,9 @@ export default function App() {
       : actions.filter((action) => assigneeFilterKey(action) === personFilter);
 
   const refreshActions = () => {
-    listActionItems(actionStatusFilter).then(setActions).catch(console.error);
+    listActionItems(actionStatusFilter, actionSortForStatus)
+      .then(setActions)
+      .catch(console.error);
   };
 
   const refreshScrapes = () => {
@@ -253,9 +265,11 @@ export default function App() {
           <ActionList
             actions={filteredActions}
             statusFilter={actionStatusFilter}
+            actionSort={actionSort}
             personFilter={personFilter}
             personOptions={personOptions}
             onStatusFilterChange={setActionStatusFilter}
+            onActionSortChange={setActionSort}
             onPersonFilterChange={changePersonFilter}
             onSourceOpen={openActionSource}
             onSourceView={viewActionSource}

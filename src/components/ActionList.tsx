@@ -2,6 +2,7 @@ import { useState } from "react";
 import type {
   CanonicalActionItem,
   ActionItemStatusFilter,
+  ActionItemSort,
 } from "../lib/types";
 
 interface PersonOption {
@@ -13,9 +14,11 @@ interface PersonOption {
 interface Props {
   actions: CanonicalActionItem[];
   statusFilter: ActionItemStatusFilter;
+  actionSort: ActionItemSort;
   personFilter: string;
   personOptions: PersonOption[];
   onStatusFilterChange: (filter: ActionItemStatusFilter) => void;
+  onActionSortChange: (sort: ActionItemSort) => void;
   onPersonFilterChange: (key: string) => void;
   onSourceOpen: (item: CanonicalActionItem) => void;
   onSourceView: (item: CanonicalActionItem) => void;
@@ -42,9 +45,11 @@ const formatTime = (ts: number) => {
 export function ActionList({
   actions,
   statusFilter,
+  actionSort,
   personFilter,
   personOptions,
   onStatusFilterChange,
+  onActionSortChange,
   onPersonFilterChange,
   onSourceOpen,
   onSourceView,
@@ -101,6 +106,20 @@ export function ActionList({
             </option>
           ))}
         </select>
+
+        {!isDismissed && (
+          <select
+            className="actions__sort"
+            value={actionSort}
+            onChange={(event) =>
+              onActionSortChange(event.currentTarget.value as ActionItemSort)
+            }
+            aria-label="Sort action items"
+          >
+            <option value="newest">Newest</option>
+            <option value="due">Due</option>
+          </select>
+        )}
       </div>
 
       {actions.length === 0 ? (
@@ -166,7 +185,12 @@ export function ActionList({
                     {item.evidenceCount > 1 && (
                       <span>{item.evidenceCount} sightings</span>
                     )}
-                    <span>{formatTime(item.lastSeenAt)}</span>
+                    {item.due && <span>Due {item.due}</span>}
+                    <span>
+                      {isDismissed
+                        ? `Dismissed ${formatTime(item.completedAt ?? item.lastSeenAt)}`
+                        : `Added ${formatTime(item.firstSeenAt)}`}
+                    </span>
                     {item.sourceKind === "discord" && (
                       <span>
                         <button
