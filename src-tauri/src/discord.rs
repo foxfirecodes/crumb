@@ -783,29 +783,36 @@ impl DiscordScraper {
             break parse_json_response(response).await?;
         };
 
-        let mut messages = batch.into_iter().map(Into::into).collect::<Vec<_>>();
+        let mut messages: Vec<NormalizedMessage> = batch.into_iter().map(Into::into).collect();
         messages.sort_by(|a: &NormalizedMessage, b| compare_message_ids(&a.id, &b.id));
         on_progress(messages.len());
         Ok(messages)
     }
 
-    pub async fn fetch_channel_message(
+    pub async fn fetch_channel_messages_around(
         &self,
         channel_id: &str,
         message_id: &str,
-    ) -> Result<NormalizedMessage> {
-        let url = format!("{DISCORD_API}/channels/{channel_id}/messages/{message_id}");
+        limit: usize,
+        target_message: Option<NormalizedMessage>,
+    ) -> Result<Vec<NormalizedMessage>> {
+        let query = vec![
+            ("limit".to_string(), limit.clamp(1, 100).to_string()),
+            ("around".into(), message_id.to_string()),
+        ];
+        let url = format!("{DISCORD_API}/channels/{channel_id}/messages");
         let mut attempts = 0;
-        let message: ApiMessage = loop {
+        let batch: Vec<ApiMessage> = loop {
             attempts += 1;
             let response = self
                 .http
                 .get(&url)
                 .header(AUTHORIZATION, self.token.as_str())
                 .header(USER_AGENT, USER_AGENT_VALUE)
+                .query(&query)
                 .send()
                 .await
-                .context("fetching Discord message")?;
+                .context("fetching Discord messages around target")?;
 
             if response.status().as_u16() == 429 {
                 let retry: RateLimit = response
@@ -822,7 +829,17 @@ impl DiscordScraper {
             break parse_json_response(response).await?;
         };
 
-        Ok(message.into())
+        let mut messages: Vec<NormalizedMessage> = batch.into_iter().map(Into::into).collect();
+        if let Some(target_message) = target_message {
+            if !messages
+                .iter()
+                .any(|message| message.id == target_message.id)
+            {
+                messages.push(target_message);
+            }
+        }
+        messages.sort_by(|a: &NormalizedMessage, b| compare_message_ids(&a.id, &b.id));
+        Ok(messages)
     }
 }
 

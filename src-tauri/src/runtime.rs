@@ -21,6 +21,7 @@ use crate::settings::AppSettings;
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WATCH_FETCH_LIMIT: usize = 100;
+const TARGETED_MESSAGE_CONTEXT_LIMIT: usize = 11;
 
 #[derive(Clone)]
 pub struct RuntimeHandle {
@@ -328,15 +329,14 @@ async fn do_scrape(
     let result = async {
         let is_targeted_message = req.target_message_id.is_some();
         let messages = if let Some(target_message_id) = req.target_message_id.as_deref() {
-            let message = match req.target_message.clone() {
-                Some(message) => message,
-                None => {
-                    scraper
-                        .fetch_channel_message(&req.channel_id, target_message_id)
-                        .await?
-                }
-            };
-            vec![message]
+            scraper
+                .fetch_channel_messages_around(
+                    &req.channel_id,
+                    target_message_id,
+                    TARGETED_MESSAGE_CONTEXT_LIMIT,
+                    req.target_message.clone(),
+                )
+                .await?
         } else {
             let scraped_range = db
                 .scraped_message_range(&req.scrape_id)
@@ -377,6 +377,7 @@ async fn do_scrape(
             &req.channel_id,
             &messages,
             &settings,
+            req.target_message_id.as_deref(),
             !is_targeted_message,
         )
         .await
@@ -537,6 +538,7 @@ async fn do_watch_poll(
             &channel.channel_id,
             &messages,
             &settings,
+            None,
             true,
         )
         .await?;
@@ -580,6 +582,7 @@ async fn extract_and_store(
     channel_id: &str,
     messages: &[NormalizedMessage],
     settings: &AppSettings,
+    selected_message_id: Option<&str>,
     update_message_range: bool,
 ) -> Result<ExtractionOutcome> {
     let existing_actions = db.list_source_actions("discord", channel_id)?;
@@ -593,14 +596,26 @@ async fn extract_and_store(
         .collect::<HashMap<_, _>>();
     let existing_decisions = db.list_source_decisions(scrape_id)?;
 
-    let extracted = ai::extract(
-        messages,
-        &existing_actions,
-        &existing_decisions,
-        Some(current_user),
-        settings,
-    )
-    .await?;
+    let extracted = if let Some(selected_message_id) = selected_message_id {
+        ai::extract_targeted_action(
+            messages,
+            selected_message_id,
+            &existing_actions,
+            &existing_decisions,
+            Some(current_user),
+            settings,
+        )
+        .await?
+    } else {
+        ai::extract(
+            messages,
+            &existing_actions,
+            &existing_decisions,
+            Some(current_user),
+            settings,
+        )
+        .await?
+    };
 
     let decisions: Vec<_> = extracted
         .decisions
@@ -633,8 +648,10 @@ async fn extract_and_store(
             }
         })
         .collect();
-    add_pr_notification_fallbacks(&mut action_items, messages, Some(current_user));
-    reconcile_pr_merge_outcomes(&existing_actions, &mut action_items, messages, current_user);
+    if selected_message_id.is_none() {
+        add_pr_notification_fallbacks(&mut action_items, messages, Some(current_user));
+        reconcile_pr_merge_outcomes(&existing_actions, &mut action_items, messages, current_user);
+    }
 
     let updated = db.mark_extracted(
         scrape_id,
@@ -650,7 +667,11 @@ async fn extract_and_store(
         &action_items,
     )?;
     let after_actions = db.list_source_actions("discord", channel_id)?;
-    let auto_dismissed_count = dismiss_resolved_pr_merge_actions(db, &after_actions, messages)?;
+    let auto_dismissed_count = if selected_message_id.is_some() {
+        0
+    } else {
+        dismiss_resolved_pr_merge_actions(db, &after_actions, messages)?
+    };
     let final_actions = if auto_dismissed_count > 0 {
         db.list_source_actions("discord", channel_id)?
     } else {

@@ -57,6 +57,33 @@ Rules:
   ]
 }"#;
 
+const TARGETED_ACTION_PROMPT: &str = r#"TARGETED ACTION MODE
+
+The user explicitly selected one Discord message and asked Crumb to add an action item.
+
+Use the surrounding transcript only as context. The selected message is the anchor.
+Derive at most one action item from the selected message and its immediate context.
+
+The action item should represent what current_user_json should do next about the selected message's own ask, request, concern, notification, review, or thing to investigate. Do not replace the selected message's ask with a different question or follow-up from transcript_after, even if it is from the same person or related to the same topic.
+
+Examples:
+- If the selected message asks current_user_json a question, create an action item to respond.
+- If the selected message asks for investigation, create an action item to investigate or follow up.
+- If the selected message reports a problem current_user_json likely owns, create an action item to look into it.
+- If context shows the selected message's own ask was already answered or resolved, return no action items, even if transcript_after contains a newer unresolved question.
+- If transcript_after contains a later question, create an action item for that later question only when that later question is the selected message.
+- If the selected message is unrelated chatter, thanks, an emoji-like response, or has no plausible follow-up, return no action items.
+
+Rules for this mode:
+- Do not extract unrelated action items from nearby messages.
+- Do not extract tasks from transcript_before or transcript_after. Use those messages only to interpret or resolve the selected message.
+- Do not extract decisions.
+- Return zero or one action_items entry. Never return more than one.
+- Prefer assigning the action item to current_user_json unless the selected message clearly names another responsible person.
+- Make the title a concise next action, not a summary of the message.
+- Reuse merge_with when this is the same real-world task as an existing action item.
+- Use a stable dedupe_key based on the selected message's underlying task, not on wording alone."#;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtractedDecision {
     pub text: String,
@@ -137,6 +164,48 @@ pub async fn extract(
         summary: parsed.summary,
         decisions: parsed.decisions,
         action_items: parsed.action_items,
+    })
+}
+
+pub async fn extract_targeted_action(
+    messages: &[NormalizedMessage],
+    selected_message_id: &str,
+    existing_actions: &[CanonicalActionItem],
+    existing_decisions: &[Decision],
+    current_user: Option<&NormalizedPerson>,
+    settings: &AppSettings,
+) -> Result<ExtractionResult> {
+    if messages.is_empty() {
+        return Ok(ExtractionResult {
+            summary: "No messages found.".into(),
+            decisions: Vec::new(),
+            action_items: Vec::new(),
+        });
+    }
+
+    let agent = build_acp_agent(settings)?;
+
+    let response = run_acp_prompt(
+        agent,
+        build_targeted_action_prompt(
+            messages,
+            selected_message_id,
+            existing_actions,
+            existing_decisions,
+            current_user,
+        )?,
+        settings,
+    )
+    .await?;
+    let json = extract_json_object(&response).with_context(|| {
+        format!("Claude ACP response did not contain a JSON object: {response}")
+    })?;
+    let parsed: Extraction = serde_json::from_str(json).context("extraction schema mismatch")?;
+
+    Ok(ExtractionResult {
+        summary: parsed.summary,
+        decisions: Vec::new(),
+        action_items: parsed.action_items.into_iter().take(1).collect(),
     })
 }
 
@@ -328,6 +397,39 @@ fn build_prompt(
     Ok(format!(
         "{SYSTEM_PROMPT}\n\nAnalyze this Discord source transcript and extract decisions, action items, and a summary. Use the existing records to merge duplicates rather than creating new variants.\n\n<current_user_json>\n{current_user_json}\n</current_user_json>\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript>\n{}\n</transcript>",
         format_transcript(messages)
+    ))
+}
+
+fn build_targeted_action_prompt(
+    messages: &[NormalizedMessage],
+    selected_message_id: &str,
+    existing_actions: &[CanonicalActionItem],
+    existing_decisions: &[Decision],
+    current_user: Option<&NormalizedPerson>,
+) -> Result<String> {
+    let existing_actions = existing_actions
+        .iter()
+        .map(ExistingActionForPrompt::from)
+        .collect::<Vec<_>>();
+    let existing_decisions = existing_decisions
+        .iter()
+        .map(ExistingDecisionForPrompt::from)
+        .collect::<Vec<_>>();
+    let existing_actions = serde_json::to_string(&existing_actions)?;
+    let existing_decisions = serde_json::to_string(&existing_decisions)?;
+    let current_user = current_user.map(current_user_for_prompt);
+    let current_user_json = serde_json::to_string(&current_user)?;
+    let known_people =
+        serde_json::to_string(&known_people_from_messages(messages, current_user.as_ref()))?;
+    let (before, selected, after) = split_messages_around_selected(messages, selected_message_id);
+    let selected_message = selected
+        .map(format_message_line)
+        .unwrap_or_else(|| format!("Selected message {selected_message_id} was not present."));
+
+    Ok(format!(
+        "{SYSTEM_PROMPT}\n\n{TARGETED_ACTION_PROMPT}\n\nIf you return one action item, its message_ids must be exactly [\"{selected_message_id}\"]. Do not include surrounding context message IDs in message_ids.\n\nAnalyze the selected Discord message and surrounding context. Use the existing records to merge duplicates rather than creating new variants.\n\n<selected_message_id>\n{selected_message_id}\n</selected_message_id>\n\n<current_user_json>\n{current_user_json}\n</current_user_json>\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript_before>\n{}\n</transcript_before>\n\n<selected_message>\n{selected_message}\n</selected_message>\n\n<transcript_after>\n{}\n</transcript_after>",
+        format_transcript(before),
+        format_transcript(after)
     ))
 }
 
@@ -580,42 +682,65 @@ fn person_for_prompt(
 fn format_transcript(messages: &[NormalizedMessage]) -> String {
     messages
         .iter()
-        .map(|m| {
-            let reply = m
-                .reply_to_id
-                .as_ref()
-                .map(|id| format!(" (reply to {id})"))
-                .unwrap_or_default();
-            let attachments = if m.attachments.is_empty() {
-                String::new()
-            } else {
-                format!(" [+{} attachment(s)]", m.attachments.len())
-            };
-            let embeds = if m.embeds.is_empty() {
-                String::new()
-            } else {
-                format!(" [embeds: {}]", m.embeds.join(" || "))
-            };
-            let components = if m.components.is_empty() {
-                String::new()
-            } else {
-                format!(" [components: {}]", m.components.join(" || "))
-            };
-            format!(
-                "[{}] [{}] <{} | {}>{}{}{}{}: {}",
-                m.timestamp,
-                m.id,
-                m.author,
-                m.author_key,
-                reply,
-                attachments,
-                embeds,
-                components,
-                m.content
-            )
-        })
+        .map(format_message_line)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_message_line(m: &NormalizedMessage) -> String {
+    let reply = m
+        .reply_to_id
+        .as_ref()
+        .map(|id| format!(" (reply to {id})"))
+        .unwrap_or_default();
+    let attachments = if m.attachments.is_empty() {
+        String::new()
+    } else {
+        format!(" [+{} attachment(s)]", m.attachments.len())
+    };
+    let embeds = if m.embeds.is_empty() {
+        String::new()
+    } else {
+        format!(" [embeds: {}]", m.embeds.join(" || "))
+    };
+    let components = if m.components.is_empty() {
+        String::new()
+    } else {
+        format!(" [components: {}]", m.components.join(" || "))
+    };
+    format!(
+        "[{}] [{}] <{} | {}>{}{}{}{}: {}",
+        m.timestamp,
+        m.id,
+        m.author,
+        m.author_key,
+        reply,
+        attachments,
+        embeds,
+        components,
+        m.content
+    )
+}
+
+fn split_messages_around_selected<'a>(
+    messages: &'a [NormalizedMessage],
+    selected_message_id: &str,
+) -> (
+    &'a [NormalizedMessage],
+    Option<&'a NormalizedMessage>,
+    &'a [NormalizedMessage],
+) {
+    let Some(index) = messages
+        .iter()
+        .position(|message| message.id == selected_message_id)
+    else {
+        return (messages, None, &[]);
+    };
+    (
+        &messages[..index],
+        Some(&messages[index]),
+        &messages[index + 1..],
+    )
 }
 
 fn extract_json_object(input: &str) -> Option<&str> {
@@ -659,4 +784,48 @@ fn extract_json_object(input: &str) -> Option<&str> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targeted_prompt_splits_context_and_anchors_message_ids() {
+        let messages = vec![
+            message("1", "Before context"),
+            message("2", "Can you look at this?"),
+            message("3", "After context"),
+        ];
+
+        let prompt = build_targeted_action_prompt(&messages, "2", &[], &[], None).unwrap();
+
+        assert!(prompt.contains("message_ids must be exactly [\"2\"]"));
+        assert!(prompt.contains("<transcript_before>\n[2026-05-26T00:00:00Z] [1]"));
+        assert!(prompt.contains("<selected_message>\n[2026-05-26T00:00:00Z] [2]"));
+        assert!(prompt.contains("<transcript_after>\n[2026-05-26T00:00:00Z] [3]"));
+        assert!(
+            prompt.contains("Return zero or one action_items entry. Never return more than one.")
+        );
+        assert!(prompt.contains(
+            "return no action items, even if transcript_after contains a newer unresolved question"
+        ));
+    }
+
+    fn message(id: &str, content: &str) -> NormalizedMessage {
+        NormalizedMessage {
+            id: id.into(),
+            author: "Ada".into(),
+            author_key: "discord:user:ada".into(),
+            author_username: "ada".into(),
+            content: content.into(),
+            timestamp: "2026-05-26T00:00:00Z".into(),
+            reply_to_id: None,
+            attachments: Vec::new(),
+            embeds: Vec::new(),
+            embed_bodies: Vec::new(),
+            components: Vec::new(),
+            mentions: Vec::new(),
+        }
+    }
 }
