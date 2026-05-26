@@ -43,6 +43,7 @@ pub fn run() {
             commands::list_scrapes,
             commands::get_scrape,
             commands::delete_source,
+            commands::open_action_source_in_discord,
             commands::list_action_items,
             commands::set_action_item_status,
             commands::set_action_item_assignee,

@@ -99,6 +99,14 @@ pub struct WatchedChannel {
     pub last_polled_at: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DiscordSource {
+    pub channel_id: String,
+    pub channel_name: Option<String>,
+    pub guild_id: Option<String>,
+    pub guild_name: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Db {
     inner: Arc<Mutex<rusqlite::Connection>>,
@@ -186,6 +194,121 @@ impl Db {
 
     pub fn list_open_action_items(&self) -> Result<Vec<CanonicalActionItem>> {
         self.list_action_items("open")
+    }
+
+    pub fn discord_source_for_action(&self, action_id: &str) -> Result<Option<DiscordSource>> {
+        let conn = self.inner.lock();
+        let source: Option<(String, String)> = conn
+            .query_row(
+                "SELECT source_kind, source_scope
+                 FROM canonical_action_items
+                 WHERE id = ?",
+                [action_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((source_kind, source_scope)) = source else {
+            return Ok(None);
+        };
+        if source_kind != "discord" {
+            bail!("action item source is not Discord");
+        }
+
+        query_latest_discord_source(&conn, &source_scope)
+    }
+
+    pub fn latest_discord_message_id_for_action(
+        &self,
+        action_id: &str,
+        channel_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT message_ids
+             FROM action_item_evidence
+             WHERE action_item_id = ?
+               AND source_kind = 'discord'
+               AND source_id = ?
+             ORDER BY created_at DESC, rowid DESC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![action_id, channel_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for raw_ids in rows {
+            let message_ids = raw_ids
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                .unwrap_or_default();
+            if let Some(message_id) = newest_discord_message_id(&message_ids) {
+                return Ok(Some(message_id));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn update_discord_source_metadata(
+        &self,
+        channel_id: &str,
+        channel_name: Option<&str>,
+        guild_id: Option<&str>,
+        guild_name: Option<&str>,
+    ) -> Result<Option<DiscordSource>> {
+        let mut conn = self.inner.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE scrapes
+             SET channel_name = COALESCE(?, channel_name),
+                 guild_id = COALESCE(?, guild_id),
+                 guild_name = COALESCE(?, guild_name)
+             WHERE source = 'discord' AND channel_id = ?",
+            rusqlite::params![channel_name, guild_id, guild_name, channel_id],
+        )?;
+        tx.execute(
+            "UPDATE watched_channels
+             SET channel_name = COALESCE(?, channel_name),
+                 guild_id = COALESCE(?, guild_id),
+                 guild_name = COALESCE(?, guild_name)
+             WHERE source = 'discord' AND channel_id = ?",
+            rusqlite::params![channel_name, guild_id, guild_name, channel_id],
+        )?;
+
+        let source = tx
+            .query_row(
+                "SELECT channel_id, channel_name, guild_id, guild_name
+                 FROM scrapes
+                 WHERE source = 'discord' AND channel_id = ?
+                 ORDER BY triggered_at DESC
+                 LIMIT 1",
+                [channel_id],
+                row_to_discord_source,
+            )
+            .optional()?;
+        if let Some(source) = source.as_ref() {
+            let source_label = format_source_label(
+                source.guild_name.as_deref(),
+                source.channel_name.as_deref(),
+                &source.channel_id,
+            );
+            tx.execute(
+                "UPDATE canonical_action_items
+                 SET source_label = ?
+                 WHERE source_kind = 'discord' AND source_scope = ?",
+                rusqlite::params![source_label, source.channel_id],
+            )?;
+            tx.execute(
+                "UPDATE action_item_evidence
+                 SET source_label = ?
+                 WHERE source_kind = 'discord' AND source_id = ?",
+                rusqlite::params![source_label, source.channel_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(source)
     }
 
     pub fn set_action_status(&self, id: &str, status: &str) -> Result<CanonicalActionItem> {
@@ -955,6 +1078,50 @@ fn row_to_watched_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchedCh
         last_seen_message_id: row.get(7)?,
         last_polled_at: row.get(8)?,
     })
+}
+
+fn row_to_discord_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<DiscordSource> {
+    Ok(DiscordSource {
+        channel_id: row.get(0)?,
+        channel_name: row.get(1)?,
+        guild_id: row.get(2)?,
+        guild_name: row.get(3)?,
+    })
+}
+
+fn query_latest_discord_source(
+    conn: &rusqlite::Connection,
+    channel_id: &str,
+) -> Result<Option<DiscordSource>> {
+    let source = conn
+        .query_row(
+            "SELECT channel_id, channel_name, guild_id, guild_name
+             FROM scrapes
+             WHERE source = 'discord' AND channel_id = ?
+             ORDER BY triggered_at DESC
+             LIMIT 1",
+            [channel_id],
+            row_to_discord_source,
+        )
+        .optional()?;
+    Ok(source)
+}
+
+fn newest_discord_message_id(message_ids: &[String]) -> Option<String> {
+    message_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .max_by(|a, b| compare_discord_ids(a, b))
+        .map(str::to_string)
+}
+
+fn compare_discord_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    let parsed = a.parse::<u128>().ok().zip(b.parse::<u128>().ok());
+    match parsed {
+        Some((a, b)) => a.cmp(&b),
+        None => a.cmp(b),
+    }
 }
 
 fn row_to_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
@@ -2069,6 +2236,131 @@ mod tests {
         let updated = db.set_action_assignee(&action_id, None, Some(""))?;
         assert_eq!(updated.assignee, None);
         assert_eq!(updated.assignee_key, None);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn discord_source_can_be_resolved_and_repaired_from_canonical_action() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-source-repair-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("dev"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("message-1"),
+            Some("message-1"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Review source deep link".into(),
+                assignee_key: None,
+                assignee: None,
+                due: None,
+                url: None,
+                message_ids: vec!["message-1".into()],
+                dedupe_key: Some("review-source-deep-link".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let action_id = db.list_open_action_items()?[0].id.clone();
+        let source = db
+            .discord_source_for_action(&action_id)?
+            .expect("discord source");
+        assert_eq!(source.channel_id, "channel-1");
+        assert_eq!(source.guild_id, None);
+        assert_eq!(
+            db.latest_discord_message_id_for_action(&action_id, "channel-1")?
+                .as_deref(),
+            Some("message-1")
+        );
+
+        let repaired = db
+            .update_discord_source_metadata(
+                "channel-1",
+                Some("dev"),
+                Some("guild-1"),
+                Some("Crumb"),
+            )?
+            .expect("repaired source");
+        assert_eq!(repaired.guild_id.as_deref(), Some("guild-1"));
+        assert_eq!(
+            db.list_open_action_items()?[0].source_label.as_deref(),
+            Some("Crumb · dev")
+        );
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn latest_discord_message_id_uses_newest_evidence_and_highest_id() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-action-message-id-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("dev"),
+            Some("guild-1"),
+            Some("Crumb"),
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("100"),
+            Some("100"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Review source deep link".into(),
+                assignee_key: None,
+                assignee: None,
+                due: None,
+                url: None,
+                message_ids: vec!["100".into()],
+                dedupe_key: Some("review-source-deep-link".into()),
+                merge_with: None,
+            }],
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("120"),
+            Some("125"),
+            2,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Review source deep link".into(),
+                assignee_key: None,
+                assignee: None,
+                due: None,
+                url: None,
+                message_ids: vec!["120".into(), "125".into()],
+                dedupe_key: Some("review-source-deep-link".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let action_id = db.list_open_action_items()?[0].id.clone();
+        assert_eq!(
+            db.latest_discord_message_id_for_action(&action_id, "channel-1")?
+                .as_deref(),
+            Some("125")
+        );
 
         let _ = std::fs::remove_file(db_path);
         Ok(())

@@ -10,6 +10,7 @@ import {
   onScrapeNew,
   onScrapeUpdated,
   onSidecarStatus,
+  openActionSourceInDiscord,
   openSettingsWindow,
   setActionItemAssignee,
   setActionItemStatus,
@@ -171,6 +172,11 @@ export default function App() {
     setView("sources");
   };
 
+  const viewActionSource = (item: CanonicalActionItem) => {
+    if (item.sourceKind !== "discord") return;
+    openActionSourceInDiscord(item.id).catch(console.error);
+  };
+
   const openActionUrl = (url: string) => {
     openUrl(url).catch(console.error);
   };
@@ -252,6 +258,7 @@ export default function App() {
             onStatusFilterChange={setActionStatusFilter}
             onPersonFilterChange={changePersonFilter}
             onSourceOpen={openActionSource}
+            onSourceView={viewActionSource}
             onUrlOpen={openActionUrl}
             onAssigneeChange={changeActionAssignee}
             onDismiss={dismissAction}

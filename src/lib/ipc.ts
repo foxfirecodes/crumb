@@ -16,6 +16,8 @@ export const getScrape = (id: string) =>
   invoke<ScrapeDetail | null>("get_scrape", { id });
 export const deleteSource = (id: string) =>
   invoke<void>("delete_source", { id });
+export const openActionSourceInDiscord = (id: string) =>
+  invoke<void>("open_action_source_in_discord", { id });
 export const listActionItems = (statusFilter: ActionItemStatusFilter) =>
   invoke<CanonicalActionItem[]>("list_action_items", { statusFilter });
 export const setActionItemStatus = (

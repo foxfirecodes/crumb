@@ -18,6 +18,7 @@ interface Props {
   onStatusFilterChange: (filter: ActionItemStatusFilter) => void;
   onPersonFilterChange: (key: string) => void;
   onSourceOpen: (item: CanonicalActionItem) => void;
+  onSourceView: (item: CanonicalActionItem) => void;
   onUrlOpen: (url: string) => void;
   onAssigneeChange: (
     id: string,
@@ -46,6 +47,7 @@ export function ActionList({
   onStatusFilterChange,
   onPersonFilterChange,
   onSourceOpen,
+  onSourceView,
   onUrlOpen,
   onAssigneeChange,
   onDismiss,
@@ -165,22 +167,39 @@ export function ActionList({
                       <span>{item.evidenceCount} sightings</span>
                     )}
                     <span>{formatTime(item.lastSeenAt)}</span>
+                    {item.sourceKind === "discord" && (
+                      <span>
+                        <button
+                          className="action-list__meta-link"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            onSourceView(item);
+                          }}
+                          onKeyDown={(event) => event.stopPropagation()}
+                        >
+                          View
+                        </button>
+                      </span>
+                    )}
                     {item.url && (
-                      <a
-                        className="action-list__pr-link"
-                        href={item.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          const url = item.url;
-                          if (url) onUrlOpen(url);
-                        }}
-                        onKeyDown={(event) => event.stopPropagation()}
-                      >
-                        PR
-                      </a>
+                      <span>
+                        <a
+                          className="action-list__meta-link"
+                          href={item.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const url = item.url;
+                            if (url) onUrlOpen(url);
+                          }}
+                          onKeyDown={(event) => event.stopPropagation()}
+                        >
+                          PR
+                        </a>
+                      </span>
                     )}
                   </div>
                 </div>

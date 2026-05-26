@@ -297,12 +297,17 @@ body {
   color: var(--fg-muted);
 }
 
-.action-list__pr-link {
+.action-list__meta-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
   color: var(--fg-dim);
+  cursor: pointer;
+  font: inherit;
   text-decoration: none;
 }
 
-.action-list__pr-link:hover {
+.action-list__meta-link:hover {
   color: var(--fg);
   text-decoration: underline;
 }

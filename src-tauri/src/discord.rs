@@ -37,6 +37,12 @@ pub struct NormalizedMessage {
     pub mentions: Vec<NormalizedPerson>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelMetadata {
+    pub channel_name: Option<String>,
+    pub guild_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct ScrapeRequest {
     pub scrape_id: String,
@@ -602,6 +608,25 @@ impl DiscordScraper {
         self.self_user.clone()
     }
 
+    pub async fn fetch_channel_metadata(&self, channel_id: &str) -> Result<ChannelMetadata> {
+        let url = format!("{DISCORD_API}/channels/{channel_id}");
+        let response = self
+            .http
+            .get(url)
+            .header(AUTHORIZATION, self.token.as_str())
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .send()
+            .await
+            .context("fetching Discord channel metadata")?;
+        let channel: PartialChannel = parse_json_response(response).await?;
+        let guild_id = channel.guild_id.clone();
+        let channel_name = format_interaction_channel_name(Some(&channel), guild_id.as_ref());
+        Ok(ChannelMetadata {
+            channel_name,
+            guild_id,
+        })
+    }
+
     pub async fn fetch_channel_messages<F>(
         &self,
         channel_id: &str,
@@ -775,6 +800,8 @@ struct InteractionOption {
 
 #[derive(Debug, Deserialize)]
 struct PartialChannel {
+    #[serde(default)]
+    guild_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
