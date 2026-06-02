@@ -84,6 +84,23 @@ Rules for this mode:
 - Reuse merge_with when this is the same real-world task as an existing action item.
 - Use a stable dedupe_key based on the selected message's underlying task, not on wording alone."#;
 
+const NOTED_ACTION_PROMPT: &str = r#"NOTED ACTION MODE
+
+The user explicitly selected one Discord message and provided a note describing the action item Crumb should add.
+
+The user's note is authoritative. Always return exactly one action_items entry, even if the selected message and surrounding transcript would not independently look action-worthy.
+
+Use the surrounding transcript only to clarify the note, enrich the title, infer a mentioned assignee/due date/URL, and understand what the selected message refers to. Do not create extra action items from nearby messages.
+
+Rules for this mode:
+- Do not extract decisions.
+- Return exactly one action_items entry. Never return zero and never return more than one.
+- The action item must be based on user_note_json. If the note is terse, combine it with selected_message and surrounding context into a concise next-action title.
+- Do not replace the user's note with a different task from transcript_before or transcript_after.
+- Prefer assigning the action item to current_user_json unless the note or selected message clearly names another responsible person.
+- Reuse merge_with when this is the same real-world task as an existing action item.
+- Use a stable dedupe_key based on both the selected message id and the user's note."#;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtractedDecision {
     pub text: String,
@@ -206,6 +223,104 @@ pub async fn extract_targeted_action(
         summary: parsed.summary,
         decisions: Vec::new(),
         action_items: parsed.action_items.into_iter().take(1).collect(),
+    })
+}
+
+pub async fn extract_noted_action(
+    messages: &[NormalizedMessage],
+    selected_message_id: &str,
+    note: &str,
+    existing_actions: &[CanonicalActionItem],
+    existing_decisions: &[Decision],
+    current_user: Option<&NormalizedPerson>,
+    settings: &AppSettings,
+) -> Result<ExtractionResult> {
+    let trimmed_note = note.trim();
+    if trimmed_note.is_empty() {
+        return Ok(ExtractionResult {
+            summary: "No note provided.".into(),
+            decisions: Vec::new(),
+            action_items: Vec::new(),
+        });
+    }
+    if messages.is_empty() {
+        return Ok(ExtractionResult {
+            summary: "Added action item from note.".into(),
+            decisions: Vec::new(),
+            action_items: vec![fallback_noted_action(
+                selected_message_id,
+                trimmed_note,
+                current_user,
+            )],
+        });
+    }
+
+    let parsed = match async {
+        let agent = build_acp_agent(settings)?;
+        let response = run_acp_prompt(
+            agent,
+            build_noted_action_prompt(
+                messages,
+                selected_message_id,
+                trimmed_note,
+                existing_actions,
+                existing_decisions,
+                current_user,
+            )?,
+            settings,
+        )
+        .await?;
+        let json = extract_json_object(&response).with_context(|| {
+            format!("Claude ACP response did not contain a JSON object: {response}")
+        })?;
+        serde_json::from_str::<Extraction>(json).context("extraction schema mismatch")
+    }
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::warn!("noted action extraction failed; falling back to note text: {e}");
+            return Ok(ExtractionResult {
+                summary: "Added action item from note.".into(),
+                decisions: Vec::new(),
+                action_items: vec![fallback_noted_action(
+                    selected_message_id,
+                    trimmed_note,
+                    current_user,
+                )],
+            });
+        }
+    };
+
+    let mut action_items = parsed.action_items.into_iter().take(1).collect::<Vec<_>>();
+    if action_items.is_empty() {
+        action_items.push(fallback_noted_action(
+            selected_message_id,
+            trimmed_note,
+            current_user,
+        ));
+    }
+    for item in &mut action_items {
+        item.text = item.text.trim().to_string();
+        if item.text.is_empty() {
+            item.text = concise_fallback_note_title(trimmed_note);
+        }
+        item.message_ids = Some(vec![selected_message_id.to_string()]);
+        if item.dedupe_key.as_deref().map_or(true, str::is_empty) {
+            item.dedupe_key = Some(noted_action_dedupe_key(selected_message_id, trimmed_note));
+        }
+        if item.assignee_key.is_none() && item.assignee.is_none() {
+            if let Some(user) = current_user {
+                item.assignee_key = Some(user.key.clone());
+                item.assignee = Some(user.display_name.clone());
+            }
+        }
+    }
+
+    Ok(ExtractionResult {
+        summary: parsed.summary,
+        decisions: Vec::new(),
+        action_items,
     })
 }
 
@@ -428,6 +543,41 @@ fn build_targeted_action_prompt(
 
     Ok(format!(
         "{SYSTEM_PROMPT}\n\n{TARGETED_ACTION_PROMPT}\n\nIf you return one action item, its message_ids must be exactly [\"{selected_message_id}\"]. Do not include surrounding context message IDs in message_ids.\n\nAnalyze the selected Discord message and surrounding context. Use the existing records to merge duplicates rather than creating new variants.\n\n<selected_message_id>\n{selected_message_id}\n</selected_message_id>\n\n<current_user_json>\n{current_user_json}\n</current_user_json>\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript_before>\n{}\n</transcript_before>\n\n<selected_message>\n{selected_message}\n</selected_message>\n\n<transcript_after>\n{}\n</transcript_after>",
+        format_transcript(before),
+        format_transcript(after)
+    ))
+}
+
+fn build_noted_action_prompt(
+    messages: &[NormalizedMessage],
+    selected_message_id: &str,
+    note: &str,
+    existing_actions: &[CanonicalActionItem],
+    existing_decisions: &[Decision],
+    current_user: Option<&NormalizedPerson>,
+) -> Result<String> {
+    let existing_actions = existing_actions
+        .iter()
+        .map(ExistingActionForPrompt::from)
+        .collect::<Vec<_>>();
+    let existing_decisions = existing_decisions
+        .iter()
+        .map(ExistingDecisionForPrompt::from)
+        .collect::<Vec<_>>();
+    let existing_actions = serde_json::to_string(&existing_actions)?;
+    let existing_decisions = serde_json::to_string(&existing_decisions)?;
+    let current_user = current_user.map(current_user_for_prompt);
+    let current_user_json = serde_json::to_string(&current_user)?;
+    let known_people =
+        serde_json::to_string(&known_people_from_messages(messages, current_user.as_ref()))?;
+    let note_json = serde_json::to_string(note)?;
+    let (before, selected, after) = split_messages_around_selected(messages, selected_message_id);
+    let selected_message = selected
+        .map(format_message_line)
+        .unwrap_or_else(|| format!("Selected message {selected_message_id} was not present."));
+
+    Ok(format!(
+        "{SYSTEM_PROMPT}\n\n{NOTED_ACTION_PROMPT}\n\nThe action item's message_ids must be exactly [\"{selected_message_id}\"]. Do not include surrounding context message IDs in message_ids.\n\nAnalyze the user's note, selected Discord message, and surrounding context. Use the existing records to merge duplicates rather than creating new variants.\n\n<selected_message_id>\n{selected_message_id}\n</selected_message_id>\n\n<user_note_json>\n{note_json}\n</user_note_json>\n\n<current_user_json>\n{current_user_json}\n</current_user_json>\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<existing_action_items_json>\n{existing_actions}\n</existing_action_items_json>\n\n<existing_decisions_json>\n{existing_decisions}\n</existing_decisions_json>\n\n<transcript_before>\n{}\n</transcript_before>\n\n<selected_message>\n{selected_message}\n</selected_message>\n\n<transcript_after>\n{}\n</transcript_after>",
         format_transcript(before),
         format_transcript(after)
     ))
@@ -743,6 +893,54 @@ fn split_messages_around_selected<'a>(
     )
 }
 
+fn fallback_noted_action(
+    selected_message_id: &str,
+    note: &str,
+    current_user: Option<&NormalizedPerson>,
+) -> ExtractedActionItem {
+    ExtractedActionItem {
+        text: concise_fallback_note_title(note),
+        assignee: current_user.map(|user| user.display_name.clone()),
+        assignee_key: current_user.map(|user| user.key.clone()),
+        due: None,
+        url: None,
+        message_ids: Some(vec![selected_message_id.to_string()]),
+        dedupe_key: Some(noted_action_dedupe_key(selected_message_id, note)),
+        merge_with: None,
+    }
+}
+
+fn concise_fallback_note_title(note: &str) -> String {
+    let trimmed = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.chars().count() <= 160 {
+        return trimmed;
+    }
+    format!("{}...", trimmed.chars().take(157).collect::<String>())
+}
+
+fn noted_action_dedupe_key(selected_message_id: &str, note: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_separator = false;
+    for ch in note.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            normalized.push('-');
+            last_was_separator = true;
+        }
+        if normalized.len() >= 80 {
+            break;
+        }
+    }
+    let normalized = normalized.trim_matches('-');
+    if normalized.is_empty() {
+        format!("noted-action-{selected_message_id}")
+    } else {
+        format!("noted-action-{selected_message_id}-{normalized}")
+    }
+}
+
 fn extract_json_object(input: &str) -> Option<&str> {
     let trimmed = input.trim();
     let without_fence = trimmed
@@ -810,6 +1008,42 @@ mod tests {
         assert!(prompt.contains(
             "return no action items, even if transcript_after contains a newer unresolved question"
         ));
+    }
+
+    #[test]
+    fn noted_prompt_includes_note_and_requires_one_anchored_item() {
+        let messages = vec![
+            message("1", "Before context"),
+            message("2", "FYI this changed"),
+            message("3", "After context"),
+        ];
+
+        let prompt = build_noted_action_prompt(
+            &messages,
+            "2",
+            "Follow up with Ada about the rollout",
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(prompt.contains("message_ids must be exactly [\"2\"]"));
+        assert!(prompt.contains("Return exactly one action_items entry."));
+        assert!(prompt.contains("<user_note_json>\n\"Follow up with Ada about the rollout\""));
+        assert!(prompt.contains("<selected_message>\n[2026-05-26T00:00:00Z] [2]"));
+    }
+
+    #[test]
+    fn fallback_noted_action_is_anchored_to_selected_message() {
+        let action = fallback_noted_action("123", "Follow up with Ada", None);
+
+        assert_eq!(action.text, "Follow up with Ada");
+        assert_eq!(action.message_ids, Some(vec!["123".into()]));
+        assert_eq!(
+            action.dedupe_key.as_deref(),
+            Some("noted-action-123-follow-up-with-ada")
+        );
     }
 
     fn message(id: &str, content: &str) -> NormalizedMessage {

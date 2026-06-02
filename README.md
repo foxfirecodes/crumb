@@ -48,6 +48,13 @@ Use these from Discord after Crumb is running:
 Fetch recent messages from the current channel/DM/thread and extract decisions + action items. Repeated scrapes avoid reprocessing messages already inside the previously scraped range.
 
 ```text
+Add action item
+Add action item with note
+```
+
+Use these message context-menu commands on a Discord message. `Add action item` asks Crumb to infer whether the selected message needs follow-up. `Add action item with note` opens a note prompt and always creates an action item from that note, linked to the selected message and enriched with nearby message context.
+
+```text
 /watch
 ```
 
