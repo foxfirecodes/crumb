@@ -955,16 +955,52 @@ fn add_pr_notification_fallbacks(
     }
 
     if let Some(current_user) = current_user {
-        for item in action_items.iter_mut().filter(|item| {
-            item.url
-                .as_deref()
-                .and_then(|url| normalize_pr_url(Some(url)))
-                .is_some()
-        }) {
+        for item in action_items
+            .iter_mut()
+            .filter(|item| is_github_app_notification_action(item, messages))
+        {
             item.assignee_key = Some(current_user.key.clone());
             item.assignee = Some(current_user.display_name.clone());
         }
     }
+}
+
+fn is_github_app_notification_action(
+    item: &ActionCandidate,
+    messages: &[NormalizedMessage],
+) -> bool {
+    let Some(action_url) = item
+        .url
+        .as_deref()
+        .and_then(|url| normalize_pr_url(Some(url)))
+    else {
+        return false;
+    };
+
+    messages
+        .iter()
+        .filter(|message| action_evidence_matches_message(item, &action_url, message))
+        .any(is_github_app_notification)
+}
+
+fn action_evidence_matches_message(
+    item: &ActionCandidate,
+    action_url: &str,
+    message: &NormalizedMessage,
+) -> bool {
+    if !item.message_ids.is_empty() {
+        return item.message_ids.iter().any(|id| id == &message.id);
+    }
+
+    find_pr_url_in_message(message).as_deref() == Some(action_url)
+}
+
+fn is_github_app_notification(message: &NormalizedMessage) -> bool {
+    contains_github_app_url(&notification_text(message))
+}
+
+fn contains_github_app_url(text: &str) -> bool {
+    text.contains("github.com/app/") || text.contains("github.com/apps/")
 }
 
 fn notification_text(message: &NormalizedMessage) -> String {
@@ -1556,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn assigns_pr_review_actions_to_current_user() {
+    fn assigns_pr_actions_from_github_app_notifications_to_current_user() {
         let mut actions = vec![ActionCandidate {
             text: "Address BugBot feedback".into(),
             assignee_key: Some("discord:user:bugbot".into()),
@@ -1567,15 +1603,51 @@ mod tests {
             dedupe_key: Some("bugbot-feedback-456".into()),
             merge_with: None,
         }];
+        let mut notification = message("1", "");
+        notification.embeds = vec![
+            "BugBot | https://github.com/apps/bugbot | Review submitted | https://github.com/example/repo/pull/456"
+                .into(),
+        ];
         let current_user = current_user();
 
-        add_pr_notification_fallbacks(&mut actions, &[], Some(&current_user));
+        add_pr_notification_fallbacks(&mut actions, &[notification], Some(&current_user));
 
         assert_eq!(
             actions[0].assignee_key.as_deref(),
             Some("discord:user:current")
         );
         assert_eq!(actions[0].assignee.as_deref(), Some("Current User"));
+    }
+
+    #[test]
+    fn keeps_human_pr_comment_assignee_from_extractor() {
+        let mut actions = vec![ActionCandidate {
+            text: "Update PR #289899 to only show the first eligible item".into(),
+            assignee_key: Some("discord:user:rodentman87".into()),
+            assignee: Some("Rodentman87".into()),
+            due: None,
+            url: Some("https://github.com/example/repo/pull/289899".into()),
+            message_ids: vec!["1".into()],
+            dedupe_key: Some("update-pr-289899-first-eligible-item".into()),
+            merge_with: None,
+        }];
+        let mut notification = message(
+            "1",
+            "Ope, yeah that was a misunderstanding on my end. I'll swap this out to only show the first eligible one",
+        );
+        notification.embeds = vec![
+            "Rodentman87 | https://github.com/Rodentman87 | Comment created - PR #289899 - [app] Generic game upsell part 2 | https://github.com/example/repo/pull/289899"
+                .into(),
+        ];
+        let current_user = current_user();
+
+        add_pr_notification_fallbacks(&mut actions, &[notification], Some(&current_user));
+
+        assert_eq!(
+            actions[0].assignee_key.as_deref(),
+            Some("discord:user:rodentman87")
+        );
+        assert_eq!(actions[0].assignee.as_deref(), Some("Rodentman87"));
     }
 
     #[test]
