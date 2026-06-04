@@ -378,6 +378,7 @@ async fn do_scrape(
             &messages,
             &settings,
             req.target_message_id.as_deref(),
+            req.action_note.as_deref(),
             !is_targeted_message,
         )
         .await
@@ -539,6 +540,7 @@ async fn do_watch_poll(
             &messages,
             &settings,
             None,
+            None,
             true,
         )
         .await?;
@@ -583,6 +585,7 @@ async fn extract_and_store(
     messages: &[NormalizedMessage],
     settings: &AppSettings,
     selected_message_id: Option<&str>,
+    action_note: Option<&str>,
     update_message_range: bool,
 ) -> Result<ExtractionOutcome> {
     let existing_actions = db.list_source_actions("discord", channel_id)?;
@@ -596,25 +599,40 @@ async fn extract_and_store(
         .collect::<HashMap<_, _>>();
     let existing_decisions = db.list_source_decisions(scrape_id)?;
 
-    let extracted = if let Some(selected_message_id) = selected_message_id {
-        ai::extract_targeted_action(
-            messages,
-            selected_message_id,
-            &existing_actions,
-            &existing_decisions,
-            Some(current_user),
-            settings,
-        )
-        .await?
-    } else {
-        ai::extract(
-            messages,
-            &existing_actions,
-            &existing_decisions,
-            Some(current_user),
-            settings,
-        )
-        .await?
+    let extracted = match (selected_message_id, action_note) {
+        (Some(selected_message_id), Some(action_note)) => {
+            ai::extract_noted_action(
+                messages,
+                selected_message_id,
+                action_note,
+                &existing_actions,
+                &existing_decisions,
+                Some(current_user),
+                settings,
+            )
+            .await?
+        }
+        (Some(selected_message_id), None) => {
+            ai::extract_targeted_action(
+                messages,
+                selected_message_id,
+                &existing_actions,
+                &existing_decisions,
+                Some(current_user),
+                settings,
+            )
+            .await?
+        }
+        (None, _) => {
+            ai::extract(
+                messages,
+                &existing_actions,
+                &existing_decisions,
+                Some(current_user),
+                settings,
+            )
+            .await?
+        }
     };
 
     let decisions: Vec<_> = extracted

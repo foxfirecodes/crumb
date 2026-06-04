@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 const DISCORD_API: &str = "https://discord.com/api/v10";
 const DISCORD_GATEWAY: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const USER_AGENT_VALUE: &str = "Crumb/0.1";
+const ACTION_NOTE_MODAL_PREFIX: &str = "crumb:add-action-note:";
 
 #[derive(Debug, Clone)]
 pub struct NormalizedPerson {
@@ -55,6 +56,7 @@ pub struct ScrapeRequest {
     pub limit: usize,
     pub target_message_id: Option<String>,
     pub target_message: Option<NormalizedMessage>,
+    pub action_note: Option<String>,
     pub reply: InteractionReply,
 }
 
@@ -312,125 +314,234 @@ impl DiscordBot {
             Some("INTERACTION_CREATE") => {
                 let interaction: InteractionCreate =
                     serde_json::from_value(payload.d).context("parsing INTERACTION_CREATE")?;
-                if interaction.kind != 2
-                    || !matches!(
-                        interaction.data.name.as_str(),
-                        "scrape" | "watch" | "unwatch" | "Add action item"
-                    )
-                {
-                    return Ok(());
-                }
-
-                if let Err(e) = self.defer_reply(&interaction).await {
-                    tracing::warn!("failed to defer Discord command reply: {e}");
-                }
-
-                let user = interaction
-                    .user
-                    .as_ref()
-                    .or_else(|| interaction.member.as_ref().map(|m| &m.user))
-                    .map(format_user_tag)
-                    .unwrap_or_else(|| "unknown".into());
-
-                let channel_id = interaction.channel_id;
-                let channel_name = match format_interaction_channel_name(
-                    interaction.channel.as_ref(),
-                    interaction.guild_id.as_ref(),
-                ) {
-                    Some(name) => Some(name),
-                    None => self
-                        .fetch_channel_name(&channel_id, interaction.guild_id.as_ref())
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("failed to fetch channel metadata: {e}");
-                            None
-                        }),
-                };
-                let guild_id = interaction.guild_id;
-                let guild_name = interaction.guild.and_then(|g| g.name);
-                let reply = InteractionReply {
-                    http: self.http.clone(),
-                    app_id: self.app_id.clone(),
-                    interaction_token: interaction.token,
-                };
-
-                let command = match interaction.data.name.as_str() {
-                    "scrape" => {
-                        let limit = interaction
-                            .data
-                            .options
-                            .iter()
-                            .find(|opt| opt.name == "limit")
-                            .and_then(|opt| opt.value.as_i64())
-                            .unwrap_or(200)
-                            .clamp(1, 1000) as usize;
-                        DiscordCommand::Scrape(ScrapeRequest {
-                            scrape_id: format!("discord:{channel_id}"),
-                            channel_id,
-                            channel_name,
-                            guild_id,
-                            guild_name,
-                            triggered_by: user,
-                            limit,
-                            target_message_id: None,
-                            target_message: None,
-                            reply,
-                        })
-                    }
-                    "Add action item" => {
-                        if interaction.data.kind != Some(3) {
+                match interaction.kind {
+                    2 => {
+                        let Some(name) = interaction.data.name.clone() else {
+                            return Ok(());
+                        };
+                        if !matches!(
+                            name.as_str(),
+                            "scrape"
+                                | "watch"
+                                | "unwatch"
+                                | "Add action item"
+                                | "Add action item with note"
+                        ) {
                             return Ok(());
                         }
-                        let Some(target_message_id) = interaction.data.target_id.clone() else {
+
+                        if name == "Add action item with note" {
+                            if interaction.data.kind != Some(3) {
+                                return Ok(());
+                            }
+                            let Some(target_message_id) = interaction.data.target_id.as_deref()
+                            else {
+                                if let Err(e) = self.defer_reply(&interaction).await {
+                                    tracing::warn!("failed to defer Discord command reply: {e}");
+                                }
+                                let reply = InteractionReply {
+                                    http: self.http.clone(),
+                                    app_id: self.app_id.clone(),
+                                    interaction_token: interaction.token,
+                                };
+                                let _ = reply
+                                    .send("Add action item with note failed: Discord did not include a target message.")
+                                    .await;
+                                return Ok(());
+                            };
+                            if let Err(e) = self
+                                .open_action_note_modal(&interaction, target_message_id)
+                                .await
+                            {
+                                tracing::warn!("failed to open Discord action-note modal: {e}");
+                                if let Err(reply_error) = self
+                                    .send_initial_ephemeral_reply(
+                                        &interaction,
+                                        "Could not open the note prompt. Please try Add action item with note again.",
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "failed to send Discord action-note modal error reply: {reply_error}"
+                                    );
+                                }
+                            }
+                            return Ok(());
+                        }
+
+                        if let Err(e) = self.defer_reply(&interaction).await {
+                            tracing::warn!("failed to defer Discord command reply: {e}");
+                        }
+
+                        let user = interaction_user_tag(&interaction);
+                        let channel_id = interaction.channel_id;
+                        let channel_name = match format_interaction_channel_name(
+                            interaction.channel.as_ref(),
+                            interaction.guild_id.as_ref(),
+                        ) {
+                            Some(name) => Some(name),
+                            None => self
+                                .fetch_channel_name(&channel_id, interaction.guild_id.as_ref())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("failed to fetch channel metadata: {e}");
+                                    None
+                                }),
+                        };
+                        let guild_id = interaction.guild_id;
+                        let guild_name = interaction.guild.and_then(|g| g.name);
+                        let reply = InteractionReply {
+                            http: self.http.clone(),
+                            app_id: self.app_id.clone(),
+                            interaction_token: interaction.token,
+                        };
+
+                        let command = match name.as_str() {
+                            "scrape" => {
+                                let limit = interaction
+                                    .data
+                                    .options
+                                    .iter()
+                                    .find(|opt| opt.name == "limit")
+                                    .and_then(|opt| opt.value.as_i64())
+                                    .unwrap_or(200)
+                                    .clamp(1, 1000)
+                                    as usize;
+                                DiscordCommand::Scrape(ScrapeRequest {
+                                    scrape_id: format!("discord:{channel_id}"),
+                                    channel_id,
+                                    channel_name,
+                                    guild_id,
+                                    guild_name,
+                                    triggered_by: user,
+                                    limit,
+                                    target_message_id: None,
+                                    target_message: None,
+                                    action_note: None,
+                                    reply,
+                                })
+                            }
+                            "Add action item" => {
+                                if interaction.data.kind != Some(3) {
+                                    return Ok(());
+                                }
+                                let Some(target_message_id) = interaction.data.target_id.clone()
+                                else {
+                                    let _ = reply
+                                        .send("Add action item failed: Discord did not include a target message.")
+                                        .await;
+                                    return Ok(());
+                                };
+                                let target_message = interaction
+                                    .data
+                                    .resolved
+                                    .as_ref()
+                                    .and_then(|resolved| resolved.messages.get(&target_message_id))
+                                    .cloned()
+                                    .map(Into::into);
+                                DiscordCommand::Scrape(ScrapeRequest {
+                                    scrape_id: format!("discord:{channel_id}"),
+                                    channel_id,
+                                    channel_name,
+                                    guild_id,
+                                    guild_name,
+                                    triggered_by: user,
+                                    limit: 1,
+                                    target_message_id: Some(target_message_id),
+                                    target_message,
+                                    action_note: None,
+                                    reply,
+                                })
+                            }
+                            "watch" => DiscordCommand::Watch(WatchRequest {
+                                interaction_id: interaction.id,
+                                channel_id,
+                                channel_name,
+                                guild_id,
+                                guild_name,
+                                triggered_by: user,
+                                reply,
+                            }),
+                            "unwatch" => DiscordCommand::Unwatch(WatchRequest {
+                                interaction_id: interaction.id,
+                                channel_id,
+                                channel_name,
+                                guild_id,
+                                guild_name,
+                                triggered_by: user,
+                                reply,
+                            }),
+                            _ => return Ok(()),
+                        };
+
+                        command_tx
+                            .send(command)
+                            .map_err(|_| anyhow!("scrape runtime is not accepting requests"))?;
+                    }
+                    5 => {
+                        let Some(target_message_id) = interaction
+                            .data
+                            .custom_id
+                            .as_deref()
+                            .and_then(action_note_modal_target_message_id)
+                            .map(str::to_string)
+                        else {
+                            return Ok(());
+                        };
+
+                        if let Err(e) = self.defer_reply(&interaction).await {
+                            tracing::warn!("failed to defer Discord modal reply: {e}");
+                        }
+
+                        let note = modal_text_value(&interaction.data.components, "note")
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty());
+                        let user = interaction_user_tag(&interaction);
+                        let channel_id = interaction.channel_id;
+                        let reply = InteractionReply {
+                            http: self.http.clone(),
+                            app_id: self.app_id.clone(),
+                            interaction_token: interaction.token,
+                        };
+                        let Some(note) = note else {
                             let _ = reply
-                                .send("Add action item failed: Discord did not include a target message.")
+                                .send("Add action item with note failed: the note was empty.")
                                 .await;
                             return Ok(());
                         };
-                        let target_message = interaction
-                            .data
-                            .resolved
-                            .as_ref()
-                            .and_then(|resolved| resolved.messages.get(&target_message_id))
-                            .cloned()
-                            .map(Into::into);
-                        DiscordCommand::Scrape(ScrapeRequest {
-                            scrape_id: format!("discord:{channel_id}"),
-                            channel_id,
-                            channel_name,
-                            guild_id,
-                            guild_name,
-                            triggered_by: user,
-                            limit: 1,
-                            target_message_id: Some(target_message_id),
-                            target_message,
-                            reply,
-                        })
+                        let channel_name = match format_interaction_channel_name(
+                            interaction.channel.as_ref(),
+                            interaction.guild_id.as_ref(),
+                        ) {
+                            Some(name) => Some(name),
+                            None => self
+                                .fetch_channel_name(&channel_id, interaction.guild_id.as_ref())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("failed to fetch channel metadata: {e}");
+                                    None
+                                }),
+                        };
+                        let guild_id = interaction.guild_id;
+                        let guild_name = interaction.guild.and_then(|g| g.name);
+                        command_tx
+                            .send(DiscordCommand::Scrape(ScrapeRequest {
+                                scrape_id: format!("discord:{channel_id}"),
+                                channel_id,
+                                channel_name,
+                                guild_id,
+                                guild_name,
+                                triggered_by: user,
+                                limit: 1,
+                                target_message_id: Some(target_message_id),
+                                target_message: None,
+                                action_note: Some(note),
+                                reply,
+                            }))
+                            .map_err(|_| anyhow!("scrape runtime is not accepting requests"))?;
                     }
-                    "watch" => DiscordCommand::Watch(WatchRequest {
-                        interaction_id: interaction.id,
-                        channel_id,
-                        channel_name,
-                        guild_id,
-                        guild_name,
-                        triggered_by: user,
-                        reply,
-                    }),
-                    "unwatch" => DiscordCommand::Unwatch(WatchRequest {
-                        interaction_id: interaction.id,
-                        channel_id,
-                        channel_name,
-                        guild_id,
-                        guild_name,
-                        triggered_by: user,
-                        reply,
-                    }),
                     _ => return Ok(()),
-                };
-
-                command_tx
-                    .send(command)
-                    .map_err(|_| anyhow!("scrape runtime is not accepting requests"))?;
+                }
             }
             _ => {}
         }
@@ -453,6 +564,77 @@ impl DiscordBot {
             .send()
             .await
             .context("deferring Discord interaction")?;
+
+        expect_success(response).await
+    }
+
+    async fn send_initial_ephemeral_reply(
+        &self,
+        interaction: &InteractionCreate,
+        content: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{DISCORD_API}/interactions/{}/{}/callback",
+            interaction.id, interaction.token
+        );
+        let response = self
+            .http
+            .post(url)
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .json(&json!({
+                "type": 4,
+                "data": {
+                    "content": content,
+                    "flags": 64
+                }
+            }))
+            .send()
+            .await
+            .context("sending Discord interaction reply")?;
+
+        expect_success(response).await
+    }
+
+    async fn open_action_note_modal(
+        &self,
+        interaction: &InteractionCreate,
+        target_message_id: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{DISCORD_API}/interactions/{}/{}/callback",
+            interaction.id, interaction.token
+        );
+        let response = self
+            .http
+            .post(url)
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .json(&json!({
+                "type": 9,
+                "data": {
+                    "custom_id": format!("{ACTION_NOTE_MODAL_PREFIX}{target_message_id}"),
+                    "title": "Add action item with note",
+                    "components": [
+                        {
+                            "type": 1,
+                            "components": [
+                                {
+                                    "type": 4,
+                                    "custom_id": "note",
+                                    "label": "What should Crumb remember to do?",
+                                    "style": 2,
+                                    "min_length": 1,
+                                    "max_length": 1000,
+                                    "required": true,
+                                    "placeholder": "e.g. Follow up with Ada about the rollout plan"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }))
+            .send()
+            .await
+            .context("opening Discord action-note modal")?;
 
         expect_success(response).await
     }
@@ -498,6 +680,12 @@ fn application_command_definitions() -> Value {
         {
             "type": 3,
             "name": "Add action item",
+            "integration_types": [1, 0],
+            "contexts": [0, 1, 2]
+        },
+        {
+            "type": 3,
+            "name": "Add action item with note",
             "integration_types": [1, 0],
             "contexts": [0, 1, 2]
         },
@@ -577,6 +765,33 @@ fn sorted_values(value: Option<&Value>) -> Value {
     let mut values = value.and_then(Value::as_array).cloned().unwrap_or_default();
     values.sort_by_key(|value| value.to_string());
     Value::Array(values)
+}
+
+fn action_note_modal_target_message_id(custom_id: &str) -> Option<&str> {
+    custom_id
+        .strip_prefix(ACTION_NOTE_MODAL_PREFIX)
+        .filter(|message_id| !message_id.is_empty())
+}
+
+fn interaction_user_tag(interaction: &InteractionCreate) -> String {
+    interaction
+        .user
+        .as_ref()
+        .or_else(|| interaction.member.as_ref().map(|m| &m.user))
+        .map(format_user_tag)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn modal_text_value(components: &[InteractionComponent], custom_id: &str) -> Option<String> {
+    for component in components {
+        if component.custom_id.as_deref() == Some(custom_id) {
+            return component.value.clone();
+        }
+        if let Some(value) = modal_text_value(&component.components, custom_id) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn command_name(command: &Value) -> String {
@@ -889,19 +1104,34 @@ struct InteractionData {
     #[serde(rename = "type")]
     #[serde(default)]
     kind: Option<u64>,
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    custom_id: Option<String>,
     #[serde(default)]
     options: Vec<InteractionOption>,
     #[serde(default)]
     target_id: Option<String>,
     #[serde(default)]
     resolved: Option<ResolvedData>,
+    #[serde(default)]
+    components: Vec<InteractionComponent>,
 }
 
 #[derive(Debug, Deserialize)]
 struct InteractionOption {
     name: String,
     value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct InteractionComponent {
+    #[serde(default)]
+    custom_id: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    components: Vec<InteractionComponent>,
 }
 
 #[derive(Debug, Deserialize)]
