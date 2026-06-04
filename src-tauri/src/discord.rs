@@ -349,8 +349,23 @@ impl DiscordBot {
                                     .await;
                                 return Ok(());
                             };
-                            self.open_action_note_modal(&interaction, target_message_id)
-                                .await?;
+                            if let Err(e) = self
+                                .open_action_note_modal(&interaction, target_message_id)
+                                .await
+                            {
+                                tracing::warn!("failed to open Discord action-note modal: {e}");
+                                if let Err(reply_error) = self
+                                    .send_initial_ephemeral_reply(
+                                        &interaction,
+                                        "Could not open the note prompt. Please try Add action item with note again.",
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "failed to send Discord action-note modal error reply: {reply_error}"
+                                    );
+                                }
+                            }
                             return Ok(());
                         }
 
@@ -549,6 +564,33 @@ impl DiscordBot {
             .send()
             .await
             .context("deferring Discord interaction")?;
+
+        expect_success(response).await
+    }
+
+    async fn send_initial_ephemeral_reply(
+        &self,
+        interaction: &InteractionCreate,
+        content: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{DISCORD_API}/interactions/{}/{}/callback",
+            interaction.id, interaction.token
+        );
+        let response = self
+            .http
+            .post(url)
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .json(&json!({
+                "type": 4,
+                "data": {
+                    "content": content,
+                    "flags": 64
+                }
+            }))
+            .send()
+            .await
+            .context("sending Discord interaction reply")?;
 
         expect_success(response).await
     }
