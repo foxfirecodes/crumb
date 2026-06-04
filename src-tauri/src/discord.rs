@@ -1048,12 +1048,12 @@ fn format_user_tag(user: &ApiUser) -> String {
 fn summarize_embed(embed: &Value) -> Option<String> {
     let object = embed.as_object()?;
     let mut parts = Vec::new();
-    if let Some(author) = object
-        .get("author")
-        .and_then(|value| value.get("name"))
-        .and_then(Value::as_str)
-    {
-        parts.push(author.to_string());
+    if let Some(author) = object.get("author") {
+        for key in ["name", "url"] {
+            if let Some(value) = author.get(key).and_then(Value::as_str) {
+                parts.push(value.to_string());
+            }
+        }
     }
     for key in ["title", "description", "url"] {
         if let Some(value) = object.get(key).and_then(Value::as_str) {
@@ -1241,5 +1241,24 @@ mod tests {
             }));
 
         assert!(!application_commands_match(&existing, &desired));
+    }
+
+    #[test]
+    fn embed_summary_preserves_author_url() {
+        let embed = json!({
+            "author": {
+                "name": "BugBot",
+                "url": "https://github.com/apps/bugbot"
+            },
+            "title": "Review submitted",
+            "url": "https://github.com/example/repo/pull/456"
+        });
+
+        assert_eq!(
+            summarize_embed(&embed).as_deref(),
+            Some(
+                "BugBot | https://github.com/apps/bugbot | Review submitted | https://github.com/example/repo/pull/456"
+            )
+        );
     }
 }

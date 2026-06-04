@@ -68,7 +68,7 @@ SQLite database in app data dir
 - Existing canonical actions are sent to the extractor so it can return `merge_with`.
 - The signed-in Discord user from `/users/@me` is passed as `current_user_json`; known Discord people are derived from message authors and mentions and passed as `known_people_json`.
 - Discord embeds and components are summarized into transcript text so notification-style messages with empty `content` can still produce action items.
-- PR URLs are requested from the extractor and also recovered deterministically from message/embed/component text when the extractor omits them. PR-linked action items are assigned to the signed-in user.
+- PR URLs are requested from the extractor and also recovered deterministically from message/embed/component text when the extractor omits them. PR-linked action items are assigned to the signed-in user only for GitHub app-authored notification evidence; human-authored PR notifications keep the extractor's assignee.
 - Approval notifications get a deterministic merge fallback: if a PR has an approval and no later merge-success notification in the scraped messages, Crumb creates a merge action item.
 - ACP/Claude sessions are configured to disable tools and keep extraction constrained to JSON output.
 
