@@ -23,13 +23,21 @@ const EMPTY_SETTINGS: AppSettings = {
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
+const settingsMessageClassName = (ok: boolean) =>
+  ok
+    ? "settings-message settings-message--ok"
+    : "settings-message settings-message--error";
+
 export default function SettingsApp() {
   const [settings, setSettings] = useState<AppSettings>(EMPTY_SETTINGS);
   const [savedDiscordAppId, setSavedDiscordAppId] = useState("");
   const [launchAtLogin, setLaunchAtLoginState] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [message, setMessage] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<SettingsTestResult | null>(null);
+  const [discordTestResult, setDiscordTestResult] =
+    useState<SettingsTestResult | null>(null);
+  const [aiTestResult, setAiTestResult] =
+    useState<SettingsTestResult | null>(null);
   const [testing, setTesting] = useState<"discord" | "ai" | null>(null);
 
   useEffect(() => {
@@ -61,7 +69,8 @@ export default function SettingsApp() {
     setSettings((current) => ({ ...current, [key]: value }));
     setSaveState("idle");
     setMessage(null);
-    setTestResult(null);
+    setDiscordTestResult(null);
+    setAiTestResult(null);
   };
 
   const save = () => {
@@ -83,11 +92,11 @@ export default function SettingsApp() {
 
   const runDiscordTest = () => {
     setTesting("discord");
-    setTestResult(null);
+    setDiscordTestResult(null);
     testDiscordSettings(settings)
-      .then(setTestResult)
+      .then(setDiscordTestResult)
       .catch((error) =>
-        setTestResult({ ok: false, message: String(error) }),
+        setDiscordTestResult({ ok: false, message: String(error) }),
       )
       .finally(() => setTesting(null));
   };
@@ -103,11 +112,11 @@ export default function SettingsApp() {
 
   const runAiTest = () => {
     setTesting("ai");
-    setTestResult(null);
+    setAiTestResult(null);
     testAiSettings(settings)
-      .then(setTestResult)
+      .then(setAiTestResult)
       .catch((error) =>
-        setTestResult({ ok: false, message: String(error) }),
+        setAiTestResult({ ok: false, message: String(error) }),
       )
       .finally(() => setTesting(null));
   };
@@ -119,7 +128,8 @@ export default function SettingsApp() {
       .catch((error) => {
         console.error(error);
         setLaunchAtLoginState(!enabled);
-        setTestResult({ ok: false, message: String(error) });
+        setSaveState("error");
+        setMessage(String(error));
       });
   };
 
@@ -139,8 +149,25 @@ export default function SettingsApp() {
       </header>
 
       <main className="settings-window__body">
+        {message && (
+          <div
+            className={
+              saveState === "error"
+                ? "settings-message settings-message--error"
+                : "settings-message settings-message--ok"
+            }
+          >
+            {message}
+          </div>
+        )}
+
         <section className="settings-section">
           <h2>Discord</h2>
+          {discordTestResult && (
+            <div className={settingsMessageClassName(discordTestResult.ok)}>
+              {discordTestResult.message}
+            </div>
+          )}
           <label className="settings-field">
             <span>Application ID</span>
             <input
@@ -186,6 +213,11 @@ export default function SettingsApp() {
 
         <section className="settings-section">
           <h2>AI Extraction</h2>
+          {aiTestResult && (
+            <div className={settingsMessageClassName(aiTestResult.ok)}>
+              {aiTestResult.message}
+            </div>
+          )}
           <div className="settings-grid">
             <label className="settings-field">
               <span>Model</span>
@@ -215,7 +247,7 @@ export default function SettingsApp() {
             <input
               value={settings.claudeConfigDir}
               onChange={(e) => update("claudeConfigDir", e.target.value)}
-              placeholder="/path/to/claude-config"
+              placeholder="~/.claude"
             />
           </label>
           <label className="settings-field">
@@ -264,22 +296,6 @@ export default function SettingsApp() {
             <span />
           </label>
         </section>
-
-        {(message || testResult) && (
-          <div
-            className={
-              testResult
-                ? testResult.ok
-                  ? "settings-message settings-message--ok"
-                  : "settings-message settings-message--error"
-                : saveState === "error"
-                  ? "settings-message settings-message--error"
-                  : "settings-message settings-message--ok"
-            }
-          >
-            {testResult ? testResult.message : message}
-          </div>
-        )}
       </main>
     </div>
   );

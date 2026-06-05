@@ -90,6 +90,9 @@ body {
 }
 
 .popover__settings {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: 0 0 auto;
   width: 28px;
   height: 28px;
@@ -100,9 +103,13 @@ body {
   color: var(--fg-dim);
   cursor: pointer;
   font: inherit;
-  font-size: 13px;
-  line-height: 24px;
+  line-height: 1;
   -webkit-app-region: no-drag;
+}
+
+.popover__settings-icon {
+  font-size: 18px;
+  line-height: 1;
 }
 
 .popover__settings:hover {
