@@ -9,9 +9,14 @@ mod events;
 mod runtime;
 mod settings;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use tauri::{
@@ -21,7 +26,7 @@ use tauri::{
     AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Position, Rect, Size,
     WindowEvent,
 };
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt, EnvFilter, Layer, Registry};
 
 /// Shared flag that lets commands ask the popover focus-loss handler to skip
 /// the next hide. Used by `open_action_source_in_discord` so the popover can
@@ -43,16 +48,76 @@ const POPOVER_WIDTH: f64 = 380.0;
 const POPOVER_HEIGHT: f64 = 520.0;
 const POPOVER_TRAY_GAP: f64 = 4.0;
 
+#[derive(Clone)]
+struct SharedLogFile(Arc<Mutex<File>>);
+
+struct SharedLogFileWriter(Arc<Mutex<File>>);
+
+impl<'writer> MakeWriter<'writer> for SharedLogFile {
+    type Writer = SharedLogFileWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        SharedLogFileWriter(self.0.clone())
+    }
+}
+
+impl Write for SharedLogFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "log file lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "log file lock poisoned"))?
+            .flush()
+    }
+}
+
+fn init_logging(app: &AppHandle) -> Option<PathBuf> {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,crumb=debug"));
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(io::stderr)
+        .with_filter(filter.clone());
+
+    let log_file = open_log_file(app).ok();
+    let log_path = log_file.as_ref().map(|(path, _)| path.clone());
+
+    if let Some((_, file)) = log_file {
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(SharedLogFile(Arc::new(Mutex::new(file))))
+            .with_filter(filter);
+        let _ = tracing::subscriber::set_global_default(
+            Registry::default().with(stderr_layer).with(file_layer),
+        );
+    } else {
+        let _ = tracing::subscriber::set_global_default(Registry::default().with(stderr_layer));
+    }
+
+    log_path
+}
+
+fn open_log_file(app: &AppHandle) -> io::Result<(PathBuf, File)> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join("crumb.log");
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    Ok((log_path, file))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,crumb=debug")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -79,6 +144,17 @@ pub fn run() {
             commands::set_launch_at_login,
         ])
         .setup(|app| {
+            let log_path = init_logging(app.handle());
+            match &log_path {
+                Some(path) => tracing::info!(
+                    path = %path.display(),
+                    "writing Crumb logs to app log file"
+                ),
+                None => {
+                    tracing::warn!("failed to open app log file; writing Crumb logs to stderr only")
+                }
+            }
+
             // Menubar app: no Dock icon, no menu bar.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
