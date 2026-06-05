@@ -59,7 +59,13 @@ pub async fn open_action_source_in_discord(
         hide_guard.suppress_next();
     }
 
-    open_with_discord(&discord_source_uri(&source, message_id.as_deref()))
+    let result = open_with_discord(&discord_source_uri(&source, message_id.as_deref()));
+    if result.is_err() && keep_open {
+        // The Discord launch never stole focus, so consume the armed flag here
+        // to avoid swallowing an unrelated focus-loss event later.
+        let _ = hide_guard.take();
+    }
+    result
 }
 
 #[tauri::command]
