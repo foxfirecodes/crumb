@@ -244,9 +244,12 @@ export default function App() {
         <button
           className="popover__settings"
           onClick={openSettings}
+          aria-label="Settings"
           title="Settings"
         >
-          ⚙
+          <span className="popover__settings-icon" aria-hidden="true">
+            ⚙
+          </span>
         </button>
       </header>
 
