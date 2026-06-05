@@ -672,7 +672,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures-util",
- "log",
  "objc2",
  "objc2-app-kit",
  "parking_lot",
@@ -683,12 +682,13 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
- "tauri-plugin-log",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

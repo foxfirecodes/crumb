@@ -101,7 +101,7 @@ pub fn spawn(app: AppHandle, db: Db) -> Result<RuntimeHandle> {
     let handle_for_task = handle.clone();
     async_runtime::spawn(async move {
         if let Err(e) = run(app.clone(), db, handle_for_task.clone(), shutdown_rx).await {
-            log::error!("runtime init failed: {e}");
+            tracing::error!("runtime init failed: {e}");
             handle_for_task.set_status(
                 SidecarStatus::Error {
                     message: e.to_string(),
@@ -135,21 +135,21 @@ async fn run(
     let scraper = match settings.discord_user_token() {
         Some(token) => match DiscordScraper::connect(token).await {
             Ok(scraper) => {
-                log::info!(
+                tracing::info!(
                     "scraper ready as {}",
                     scraper.user().as_deref().unwrap_or("unknown")
                 );
                 Some(scraper)
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "scraper offline: {e}. /scrape will reject until the Discord user token is valid."
                 );
                 None
             }
         },
         None => {
-            log::warn!("no Discord user token provided; /scrape will be rejected");
+            tracing::warn!("no Discord user token provided; /scrape will be rejected");
             None
         }
     };
@@ -243,12 +243,12 @@ async fn watch_scheduler_loop(
                 let watched = match db.list_watched_channels() {
                     Ok(watched) => watched,
                     Err(e) => {
-                        log::warn!("failed to list watched channels: {e}");
+                        tracing::warn!("failed to list watched channels: {e}");
                         continue;
                     }
                 };
                 for channel in watched {
-                    log::debug!(
+                    tracing::debug!(
                         "queueing watch poll for {} watched by {} at {} last polled {:?}",
                         channel.channel_id,
                         channel.watched_by,
@@ -312,7 +312,7 @@ async fn do_scrape(
             let _ = app.emit("scrape:new", &summary);
         }
         Err(e) => {
-            log::error!("insert_running: {e}");
+            tracing::error!("insert_running: {e}");
             let _ = req.reply.send(format!("Scrape failed: {e}")).await;
             return;
         }
@@ -341,12 +341,12 @@ async fn do_scrape(
             let scraped_range = db
                 .scraped_message_range(&req.scrape_id)
                 .unwrap_or_else(|e| {
-                    log::warn!("failed to load scrape range: {e}");
+                    tracing::warn!("failed to load scrape range: {e}");
                     Default::default()
                 });
             scraper
                 .fetch_channel_messages(&req.channel_id, req.limit, |fetched| {
-                    log::debug!("progress {}: {}", req.scrape_id, fetched);
+                    tracing::debug!("progress {}: {}", req.scrape_id, fetched);
                 })
                 .await?
                 .into_iter()
@@ -409,7 +409,7 @@ async fn do_scrape(
             let msg = format!("{e:?}");
             let user_msg = user_facing_scrape_error(&msg);
             let source_error = source_tab_scrape_error(&msg, &user_msg);
-            log::error!("scrape failed: {msg}");
+            tracing::error!("scrape failed: {msg}");
             emit_failed(&app, &db, &req.scrape_id, &source_error);
             let _ = req.reply.send(format!("Scrape failed: {user_msg}")).await;
         }
@@ -459,7 +459,7 @@ async fn do_watch(db: Db, scraper: Option<DiscordScraper>, req: WatchRequest) {
                 .await;
         }
         Err(e) => {
-            log::error!("watch failed: {e}");
+            tracing::error!("watch failed: {e}");
             let _ = req.reply.send(format!("Watch failed: {e}")).await;
         }
     }
@@ -479,7 +479,7 @@ async fn do_unwatch(db: Db, req: WatchRequest) {
             let _ = req.reply.send("This channel was not being watched.").await;
         }
         Err(e) => {
-            log::error!("unwatch failed: {e}");
+            tracing::error!("unwatch failed: {e}");
             let _ = req.reply.send(format!("Unwatch failed: {e}")).await;
         }
     }
@@ -493,7 +493,7 @@ async fn do_watch_poll(
     channel: WatchedChannel,
 ) {
     let Some(scraper) = scraper else {
-        log::warn!("skipping watch poll; scraper is offline");
+        tracing::warn!("skipping watch poll; scraper is offline");
         return;
     };
     let current_user = scraper.self_user();
@@ -563,7 +563,7 @@ async fn do_watch_poll(
         }
         Ok(None) => {}
         Err(e) => {
-            log::error!("watch poll failed for {}: {e}", channel.channel_id);
+            tracing::error!("watch poll failed for {}: {e}", channel.channel_id);
             emit_failed(&app, &db, &scrape_id, &e.to_string());
         }
     }
@@ -788,7 +788,7 @@ fn notify_new_actions(app: &AppHandle, count: usize, source_label: Option<&str>)
         .body(body)
         .show()
     {
-        log::warn!("failed to send notification: {e}");
+        tracing::warn!("failed to send notification: {e}");
     }
 }
 
@@ -1232,7 +1232,7 @@ fn emit_failed(app: &AppHandle, db: &Db, scrape_id: &str, error: &str) {
         Ok(updated) => {
             let _ = app.emit("scrape:updated", &updated);
         }
-        Err(e) => log::error!("mark_failed: {e}"),
+        Err(e) => tracing::error!("mark_failed: {e}"),
     }
 }
 

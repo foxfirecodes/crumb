@@ -115,7 +115,7 @@ impl DiscordBot {
             .await
             .context("Discord command fetch failed")?;
         if application_commands_match(&existing, &body) {
-            log::info!("Discord commands already up to date");
+            tracing::info!("Discord commands already up to date");
             return Ok(());
         }
 
@@ -132,7 +132,7 @@ impl DiscordBot {
         expect_success(response)
             .await
             .context("Discord command registration failed")?;
-        log::info!("registered Discord commands");
+        tracing::info!("registered Discord commands");
         Ok(())
     }
 
@@ -188,7 +188,7 @@ impl DiscordBot {
             }
 
             if let Err(e) = result {
-                log::warn!("Discord gateway disconnected: {e}");
+                tracing::warn!("Discord gateway disconnected: {e}");
             }
 
             tokio::select! {
@@ -279,7 +279,7 @@ impl DiscordBot {
                                         .context("identifying Discord gateway")?;
                                 }
                                 11 => {}
-                                other => log::debug!("ignored Discord gateway op {other}"),
+                                other => tracing::debug!("ignored Discord gateway op {other}"),
                             }
                         }
                         Message::Ping(bytes) => {
@@ -306,7 +306,7 @@ impl DiscordBot {
                 let ready: ReadyEvent =
                     serde_json::from_value(payload.d).context("parsing READY")?;
                 let bot_user = Some(format_user_tag(&ready.user));
-                log::info!("bot ready as {}", bot_user.as_deref().unwrap_or("unknown"));
+                tracing::info!("bot ready as {}", bot_user.as_deref().unwrap_or("unknown"));
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(BotReady { bot_user });
                 }
@@ -337,7 +337,7 @@ impl DiscordBot {
                             let Some(target_message_id) = interaction.data.target_id.as_deref()
                             else {
                                 if let Err(e) = self.defer_reply(&interaction).await {
-                                    log::warn!("failed to defer Discord command reply: {e}");
+                                    tracing::warn!("failed to defer Discord command reply: {e}");
                                 }
                                 let reply = InteractionReply {
                                     http: self.http.clone(),
@@ -353,7 +353,7 @@ impl DiscordBot {
                                 .open_action_note_modal(&interaction, target_message_id)
                                 .await
                             {
-                                log::warn!("failed to open Discord action-note modal: {e}");
+                                tracing::warn!("failed to open Discord action-note modal: {e}");
                                 if let Err(reply_error) = self
                                     .send_initial_ephemeral_reply(
                                         &interaction,
@@ -361,7 +361,7 @@ impl DiscordBot {
                                     )
                                     .await
                                 {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "failed to send Discord action-note modal error reply: {reply_error}"
                                     );
                                 }
@@ -370,7 +370,7 @@ impl DiscordBot {
                         }
 
                         if let Err(e) = self.defer_reply(&interaction).await {
-                            log::warn!("failed to defer Discord command reply: {e}");
+                            tracing::warn!("failed to defer Discord command reply: {e}");
                         }
 
                         let user = interaction_user_tag(&interaction);
@@ -384,7 +384,7 @@ impl DiscordBot {
                                 .fetch_channel_name(&channel_id, interaction.guild_id.as_ref())
                                 .await
                                 .unwrap_or_else(|e| {
-                                    log::warn!("failed to fetch channel metadata: {e}");
+                                    tracing::warn!("failed to fetch channel metadata: {e}");
                                     None
                                 }),
                         };
@@ -490,7 +490,7 @@ impl DiscordBot {
                         };
 
                         if let Err(e) = self.defer_reply(&interaction).await {
-                            log::warn!("failed to defer Discord modal reply: {e}");
+                            tracing::warn!("failed to defer Discord modal reply: {e}");
                         }
 
                         let note = modal_text_value(&interaction.data.components, "note")
@@ -518,7 +518,7 @@ impl DiscordBot {
                                 .fetch_channel_name(&channel_id, interaction.guild_id.as_ref())
                                 .await
                                 .unwrap_or_else(|e| {
-                                    log::warn!("failed to fetch channel metadata: {e}");
+                                    tracing::warn!("failed to fetch channel metadata: {e}");
                                     None
                                 }),
                         };
