@@ -9,6 +9,11 @@ mod events;
 mod runtime;
 mod settings;
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -17,6 +22,22 @@ use tauri::{
     WindowEvent,
 };
 use tracing_subscriber::EnvFilter;
+
+/// Shared flag that lets commands ask the popover focus-loss handler to skip
+/// the next hide. Used by `open_action_source_in_discord` so the popover can
+/// stay visible while Discord steals focus.
+#[derive(Clone, Default)]
+pub struct PopoverHideGuard(Arc<AtomicBool>);
+
+impl PopoverHideGuard {
+    pub fn suppress_next(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
 
 const POPOVER_WIDTH: f64 = 380.0;
 const POPOVER_HEIGHT: f64 = 520.0;
@@ -69,6 +90,8 @@ pub fn run() {
             let runtime = runtime::RuntimeManager::start(app.handle().clone(), database)?;
             app.manage(runtime);
 
+            app.manage(PopoverHideGuard::default());
+
             let tray_menu = MenuBuilder::new(app)
                 .items(&[
                     &MenuItemBuilder::with_id("show", "Show Crumb").build(app)?,
@@ -113,8 +136,12 @@ pub fn run() {
             // Hide popover on focus loss so it behaves like a real menubar dropdown.
             if let Some(win) = app.get_webview_window("popover") {
                 let win_clone = win.clone();
+                let guard = app.state::<PopoverHideGuard>().inner().clone();
                 win.on_window_event(move |ev| {
                     if let WindowEvent::Focused(false) = ev {
+                        if guard.take() {
+                            return;
+                        }
                         let _ = win_clone.hide();
                     }
                 });
