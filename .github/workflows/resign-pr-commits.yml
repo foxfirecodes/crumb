@@ -1,0 +1,141 @@
+name: Re-sign PR commits
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number whose branch should be re-signed
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  resign:
+    name: Re-sign commits
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Read pull request metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          head_repo="$(jq -r '.head.repo.full_name' <<<"${pr_json}")"
+          head_ref="$(jq -r '.head.ref' <<<"${pr_json}")"
+          head_sha="$(jq -r '.head.sha' <<<"${pr_json}")"
+          base_ref="$(jq -r '.base.ref' <<<"${pr_json}")"
+
+          if [[ "${head_repo}" != "${REPOSITORY}" ]]; then
+            echo "::error::This workflow only re-signs same-repository PR branches. Push fork PR commits to a branch in ${REPOSITORY}, then run this workflow on that PR."
+            exit 1
+          fi
+
+          {
+            echo "head_ref=${head_ref}"
+            echo "head_sha=${head_sha}"
+            echo "base_ref=${base_ref}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure GPG signing
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.PR_RESIGN_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.PR_RESIGN_GPG_PASSPHRASE }}
+          GIT_USER_NAME: ${{ secrets.PR_RESIGN_GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ secrets.PR_RESIGN_GIT_USER_EMAIL }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GPG_PRIVATE_KEY}" ]]; then
+            echo "::error::Missing PR_RESIGN_GPG_PRIVATE_KEY secret. Store the ASCII-armored private signing key there."
+            exit 1
+          fi
+
+          if [[ -z "${GIT_USER_NAME}" || -z "${GIT_USER_EMAIL}" ]]; then
+            echo "::error::Missing PR_RESIGN_GIT_USER_NAME or PR_RESIGN_GIT_USER_EMAIL secret. These should match the signing key identity you want GitHub to verify."
+            exit 1
+          fi
+
+          mkdir -p "${HOME}/.gnupg"
+          chmod 700 "${HOME}/.gnupg"
+          printf 'allow-loopback-pinentry\n' >"${HOME}/.gnupg/gpg-agent.conf"
+
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ { print $10; exit }')"
+
+          if [[ -z "${fingerprint}" ]]; then
+            echo "::error::Imported GPG key did not expose a secret-key fingerprint."
+            exit 1
+          fi
+
+          cat >"${RUNNER_TEMP}/gpg-wrapper" <<'EOF'
+          #!/usr/bin/env bash
+          exec gpg --batch --yes --pinentry-mode loopback --passphrase "${GPG_PASSPHRASE:-}" "$@"
+          EOF
+          chmod 700 "${RUNNER_TEMP}/gpg-wrapper"
+
+          git config --global user.name "${GIT_USER_NAME}"
+          git config --global user.email "${GIT_USER_EMAIL}"
+          git config --global user.signingkey "${fingerprint}"
+          git config --global commit.gpgsign true
+          git config --global gpg.program "${RUNNER_TEMP}/gpg-wrapper"
+
+      - name: Re-sign commits
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          GPG_PASSPHRASE: ${{ secrets.PR_RESIGN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+          current_head_sha="$(git rev-parse HEAD)"
+          if [[ "${current_head_sha}" != "${EXPECTED_HEAD_SHA}" ]]; then
+            echo "::error::PR branch moved after metadata was read. Re-run the workflow so it can rewrite the current head."
+            exit 1
+          fi
+
+          merge_base="$(git merge-base "origin/${BASE_REF}" HEAD)"
+          commit_count="$(git rev-list --count "${merge_base}..HEAD")"
+
+          if [[ "${commit_count}" -eq 0 ]]; then
+            echo "No commits to re-sign."
+            exit 0
+          fi
+
+          git rebase --empty=keep --exec 'git commit --amend --no-edit --no-verify -S' "${merge_base}"
+
+          bad_signatures="$(git log --format='%H %G?' "${merge_base}..HEAD" | awk '$2 !~ /^(G|U)$/ { print }')"
+          if [[ -n "${bad_signatures}" ]]; then
+            echo "::error::Some rewritten commits are missing valid local GPG signatures:"
+            echo "${bad_signatures}"
+            exit 1
+          fi
+
+      - name: Push rewritten PR branch
+        env:
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          git push --force-with-lease="refs/heads/${HEAD_REF}:${EXPECTED_HEAD_SHA}" origin "HEAD:${HEAD_REF}"
