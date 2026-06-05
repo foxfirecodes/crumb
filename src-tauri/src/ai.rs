@@ -280,7 +280,7 @@ pub async fn extract_noted_action(
     {
         Ok(parsed) => parsed,
         Err(e) => {
-            tracing::warn!("noted action extraction failed; falling back to note text: {e}");
+            log::warn!("noted action extraction failed; falling back to note text: {e}");
             return Ok(ExtractionResult {
                 summary: "Added action item from note.".into(),
                 decisions: Vec::new(),
@@ -670,7 +670,7 @@ fn crumb_ai_model(settings: &AppSettings) -> String {
     if normalized.contains("sonnet") || normalized.contains("haiku") {
         requested.to_string()
     } else {
-        tracing::warn!("unsupported AI model setting {requested}; falling back to sonnet");
+        log::warn!("unsupported AI model setting {requested}; falling back to sonnet");
         "sonnet".into()
     }
 }
@@ -681,7 +681,7 @@ fn crumb_ai_effort(settings: &AppSettings) -> String {
     if matches!(normalized.as_str(), "low" | "medium" | "high" | "xhigh") {
         normalized
     } else {
-        tracing::warn!("unsupported AI effort setting {requested}; falling back to low");
+        log::warn!("unsupported AI effort setting {requested}; falling back to low");
         "low".into()
     }
 }

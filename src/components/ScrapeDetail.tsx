@@ -40,6 +40,12 @@ export function ScrapeDetailView({
       </h2>
 
       {scrape.summary && <p className="detail__summary">{scrape.summary}</p>}
+      {scrape.status === "failed" && scrape.error && (
+        <section className="detail__error" aria-label="Source error details">
+          <h3>Error details</h3>
+          <pre>{scrape.error}</pre>
+        </section>
+      )}
 
       <section className="detail__section">
         <h3>Decisions ({decisions.length})</h3>

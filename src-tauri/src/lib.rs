@@ -21,7 +21,6 @@ use tauri::{
     AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Position, Rect, Size,
     WindowEvent,
 };
-use tracing_subscriber::EnvFilter;
 
 /// Shared flag that lets commands ask the popover focus-loss handler to skip
 /// the next hide. Used by `open_action_source_in_discord` so the popover can
@@ -45,15 +44,22 @@ const POPOVER_TRAY_GAP: f64 = 4.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,crumb=debug")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .clear_targets()
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stderr,
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("crumb".to_string()),
+                    },
+                ))
+                .level(log::LevelFilter::Info)
+                .level_for("crumb_lib", log::LevelFilter::Debug)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -79,6 +85,8 @@ pub fn run() {
             commands::set_launch_at_login,
         ])
         .setup(|app| {
+            log::info!("writing Crumb logs to the Tauri app log directory");
+
             // Menubar app: no Dock icon, no menu bar.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

@@ -77,7 +77,7 @@ export function ScrapeList({
             <div className="scrape-list__summary">{s.summary}</div>
           )}
           {s.status === "failed" && s.error && (
-            <div className="scrape-list__error">{s.error}</div>
+            <pre className="scrape-list__error">{s.error}</pre>
           )}
         </li>
       ))}
