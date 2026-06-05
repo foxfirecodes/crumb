@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   getAppSettings,
   getLaunchAtLogin,
@@ -24,6 +25,7 @@ type SaveState = "idle" | "saving" | "saved" | "error";
 
 export default function SettingsApp() {
   const [settings, setSettings] = useState<AppSettings>(EMPTY_SETTINGS);
+  const [savedDiscordAppId, setSavedDiscordAppId] = useState("");
   const [launchAtLogin, setLaunchAtLoginState] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [message, setMessage] = useState<string | null>(null);
@@ -32,7 +34,10 @@ export default function SettingsApp() {
 
   useEffect(() => {
     getAppSettings()
-      .then(setSettings)
+      .then((loaded) => {
+        setSettings(loaded);
+        setSavedDiscordAppId(loaded.discordAppId.trim());
+      })
       .catch((error) => {
         console.error(error);
         setMessage(String(error));
@@ -44,6 +49,10 @@ export default function SettingsApp() {
   }, []);
 
   const canSave = useMemo(() => saveState !== "saving", [saveState]);
+  const installDiscordAppId =
+    settings.discordAppId.trim() === savedDiscordAppId
+      ? savedDiscordAppId
+      : "";
 
   const update = <K extends keyof AppSettings>(
     key: K,
@@ -61,6 +70,7 @@ export default function SettingsApp() {
     saveAppSettings(settings)
       .then((saved) => {
         setSettings(saved);
+        setSavedDiscordAppId(saved.discordAppId.trim());
         setSaveState("saved");
         setMessage("Settings saved.");
       })
@@ -80,6 +90,15 @@ export default function SettingsApp() {
         setTestResult({ ok: false, message: String(error) }),
       )
       .finally(() => setTesting(null));
+  };
+
+  const installDiscordApp = () => {
+    if (!installDiscordAppId) return;
+    openUrl(
+      `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(
+        installDiscordAppId,
+      )}&scope=applications.commands&integration_type=1`,
+    ).catch(console.error);
   };
 
   const runAiTest = () => {
@@ -146,13 +165,23 @@ export default function SettingsApp() {
               onChange={(e) => update("discordUserToken", e.target.value)}
             />
           </label>
-          <button
-            className="settings-window__secondary"
-            onClick={runDiscordTest}
-            disabled={testing !== null}
-          >
-            {testing === "discord" ? "Testing..." : "Test Discord"}
-          </button>
+          <div className="settings-actions">
+            <button
+              className="settings-window__secondary"
+              onClick={runDiscordTest}
+              disabled={testing !== null}
+            >
+              {testing === "discord" ? "Testing..." : "Test Discord"}
+            </button>
+            {installDiscordAppId && (
+              <button
+                className="settings-window__secondary"
+                onClick={installDiscordApp}
+              >
+                Install App
+              </button>
+            )}
+          </div>
         </section>
 
         <section className="settings-section">

@@ -753,6 +753,12 @@ body {
   gap: 10px;
 }
 
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .settings-field {
   display: grid;
   gap: 5px;
