@@ -88,6 +88,7 @@ export interface AppSettings {
   aiEffort: string;
   claudeConfigDir: string;
   acpAgentCommand: string;
+  keepPopoverOpenOnView: boolean;
 }
 
 export interface SettingsTestResult {

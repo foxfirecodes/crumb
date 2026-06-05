@@ -10,6 +10,7 @@ use crate::discord::{DiscordBot, DiscordScraper};
 use crate::events::{CanonicalActionItem, ScrapeDetail, ScrapeSummary, SidecarStatus};
 use crate::runtime::RuntimeManager;
 use crate::settings::{AppSettings, SettingsTestResult};
+use crate::PopoverHideGuard;
 
 #[tauri::command]
 pub fn list_scrapes(db: State<'_, Db>) -> Result<Vec<ScrapeSummary>, String> {
@@ -35,6 +36,7 @@ pub async fn open_action_source_in_discord(
     id: String,
     app: AppHandle,
     db: State<'_, Db>,
+    hide_guard: State<'_, PopoverHideGuard>,
 ) -> Result<(), String> {
     let db = db.inner().clone();
     let mut source = db
@@ -49,6 +51,14 @@ pub async fn open_action_source_in_discord(
     let message_id = db
         .latest_discord_message_id_for_action(&id, &source.channel_id)
         .map_err(|e| e.to_string())?;
+
+    let keep_open = crate::settings::load_or_import(&app)
+        .map(|s| s.keep_popover_open_on_view)
+        .unwrap_or(false);
+    if keep_open {
+        hide_guard.suppress_next();
+    }
+
     open_with_discord(&discord_source_uri(&source, message_id.as_deref()))
 }
 

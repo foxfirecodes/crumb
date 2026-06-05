@@ -17,6 +17,7 @@ const EMPTY_SETTINGS: AppSettings = {
   aiEffort: "low",
   claudeConfigDir: "",
   acpAgentCommand: "",
+  keepPopoverOpenOnView: false,
 };
 
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -44,7 +45,10 @@ export default function SettingsApp() {
 
   const canSave = useMemo(() => saveState !== "saving", [saveState]);
 
-  const update = (key: keyof AppSettings, value: string) => {
+  const update = <K extends keyof AppSettings>(
+    key: K,
+    value: AppSettings[K],
+  ) => {
     setSettings((current) => ({ ...current, [key]: value }));
     setSaveState("idle");
     setMessage(null);
@@ -211,6 +215,22 @@ export default function SettingsApp() {
               type="checkbox"
               checked={launchAtLogin}
               onChange={(e) => toggleLaunchAtLogin(e.target.checked)}
+            />
+            <span />
+          </label>
+        </section>
+
+        <section className="settings-section settings-section--row">
+          <div>
+            <h2>Keep popover open when viewing in Discord</h2>
+          </div>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              checked={settings.keepPopoverOpenOnView}
+              onChange={(e) =>
+                update("keepPopoverOpenOnView", e.target.checked)
+              }
             />
             <span />
           </label>

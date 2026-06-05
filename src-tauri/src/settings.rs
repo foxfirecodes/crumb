@@ -21,6 +21,8 @@ pub struct AppSettings {
     pub claude_config_dir: String,
     #[serde(default)]
     pub acp_agent_command: String,
+    #[serde(default)]
+    pub keep_popover_open_on_view: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +58,7 @@ impl Default for AppSettings {
             ai_effort: default_ai_effort(),
             claude_config_dir: String::new(),
             acp_agent_command: String::new(),
+            keep_popover_open_on_view: false,
         }
     }
 }
@@ -174,6 +177,10 @@ fn load_legacy_env(app: &AppHandle) -> Result<Option<AppSettings>> {
             "CRUMB_AI_EFFORT" => settings.ai_effort = value,
             "CRUMB_CLAUDE_CONFIG_DIR" => settings.claude_config_dir = value,
             "CRUMB_ACP_AGENT_COMMAND" => settings.acp_agent_command = value,
+            "CRUMB_KEEP_POPOVER_OPEN_ON_VIEW" => {
+                settings.keep_popover_open_on_view =
+                    matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+            }
             _ => continue,
         }
         found = true;
