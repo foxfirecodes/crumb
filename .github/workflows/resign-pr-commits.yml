@@ -149,6 +149,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Use --raw-field for workflow inputs so gh does not coerce
+          # string-typed inputs such as the PR number into JSON numbers.
           gh api \
             --method POST \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/dispatches" \
