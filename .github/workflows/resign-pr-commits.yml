@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write
   pull-requests: read
+  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-pr-${{ inputs.pr_number }}
@@ -139,3 +140,18 @@ jobs:
           set -euo pipefail
 
           git push --force-with-lease="refs/heads/${HEAD_REF}:${EXPECTED_HEAD_SHA}" origin "HEAD:${HEAD_REF}"
+
+      - name: Trigger CI on signed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/dispatches" \
+            --field ref="${HEAD_REF}" \
+            --field inputs[source]="resign-commits" \
+            --field inputs[pr]="${PR_NUMBER}"

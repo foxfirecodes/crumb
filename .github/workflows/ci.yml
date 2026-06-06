@@ -7,6 +7,17 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Why this CI run was dispatched"
+        required: false
+        default: "manual"
+        type: string
+      pr:
+        description: "Pull request number, when dispatched from re-sign workflow"
+        required: false
+        type: string
 
 permissions:
   contents: read
