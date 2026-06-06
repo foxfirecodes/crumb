@@ -15,10 +15,11 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
 
+use parking_lot::{Mutex, MutexGuard};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -51,55 +52,61 @@ const POPOVER_TRAY_GAP: f64 = 4.0;
 #[derive(Clone)]
 struct SharedLogFile(Arc<Mutex<File>>);
 
-struct SharedLogFileWriter(Arc<Mutex<File>>);
+struct SharedLogFileWriter<'writer>(MutexGuard<'writer, File>);
 
 impl<'writer> MakeWriter<'writer> for SharedLogFile {
-    type Writer = SharedLogFileWriter;
+    type Writer = SharedLogFileWriter<'writer>;
 
     fn make_writer(&'writer self) -> Self::Writer {
-        SharedLogFileWriter(self.0.clone())
+        SharedLogFileWriter(self.0.lock())
     }
 }
 
-impl Write for SharedLogFileWriter {
+impl Write for SharedLogFileWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "log file lock poisoned"))?
-            .write(buf)
+        self.0.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "log file lock poisoned"))?
-            .flush()
+        self.0.flush()
     }
 }
 
-fn init_logging(app: &AppHandle) -> Option<PathBuf> {
+fn init_logging(app: &AppHandle) -> (Option<PathBuf>, Option<String>) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,crumb=debug"));
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(io::stderr)
         .with_filter(filter.clone());
 
-    let log_file = open_log_file(app).ok();
-    let log_path = log_file.as_ref().map(|(path, _)| path.clone());
-
-    if let Some((_, file)) = log_file {
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(SharedLogFile(Arc::new(Mutex::new(file))))
-            .with_filter(filter);
-        let _ = tracing::subscriber::set_global_default(
-            Registry::default().with(stderr_layer).with(file_layer),
-        );
-    } else {
-        let _ = tracing::subscriber::set_global_default(Registry::default().with(stderr_layer));
+    match open_log_file(app) {
+        Ok((log_path, file)) => {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(SharedLogFile(Arc::new(Mutex::new(file))))
+                .with_filter(filter);
+            let init_result = tracing::subscriber::set_global_default(
+                Registry::default().with(stderr_layer).with(file_layer),
+            );
+            let init_error = init_result
+                .err()
+                .map(|error| format!("initializing tracing subscriber: {error}"));
+            (Some(log_path), init_error)
+        }
+        Err(error) => {
+            let init_result =
+                tracing::subscriber::set_global_default(Registry::default().with(stderr_layer));
+            let message = init_result.err().map_or_else(
+                || format!("opening app log file: {error}"),
+                |init_error| {
+                    format!(
+                        "opening app log file: {error}; initializing tracing subscriber: {init_error}"
+                    )
+                },
+            );
+            (None, Some(message))
+        }
     }
-
-    log_path
 }
 
 fn open_log_file(app: &AppHandle) -> io::Result<(PathBuf, File)> {
@@ -144,15 +151,18 @@ pub fn run() {
             commands::set_launch_at_login,
         ])
         .setup(|app| {
-            let log_path = init_logging(app.handle());
-            match &log_path {
-                Some(path) => tracing::info!(
+            let (log_path, log_error) = init_logging(app.handle());
+            if let Some(path) = &log_path {
+                tracing::info!(
                     path = %path.display(),
                     "writing Crumb logs to app log file"
-                ),
-                None => {
-                    tracing::warn!("failed to open app log file; writing Crumb logs to stderr only")
-                }
+                );
+            }
+            if let Some(error) = &log_error {
+                tracing::warn!(
+                    error = %error,
+                    "Crumb log file setup had a problem; stderr logging remains available"
+                );
             }
 
             // Menubar app: no Dock icon, no menu bar.
