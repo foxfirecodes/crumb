@@ -406,10 +406,11 @@ async fn do_scrape(
                 .await;
         }
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{e:?}");
             let user_msg = user_facing_scrape_error(&msg);
+            let source_error = source_tab_scrape_error(&msg, &user_msg);
             tracing::error!("scrape failed: {msg}");
-            emit_failed(&app, &db, &req.scrape_id, &user_msg);
+            emit_failed(&app, &db, &req.scrape_id, &source_error);
             let _ = req.reply.send(format!("Scrape failed: {user_msg}")).await;
         }
     }
@@ -1216,6 +1217,14 @@ fn user_facing_scrape_error(error: &str) -> String {
         return "Claude Code authentication is required for extraction. Run `claude` in a terminal and complete login, or clear/fix the configured Claude config dir if it points at an unauthenticated config.".into();
     }
     error.into()
+}
+
+fn source_tab_scrape_error(error: &str, user_error: &str) -> String {
+    if error == user_error {
+        return error.into();
+    }
+
+    format!("{user_error}\n\nDetails:\n{error}")
 }
 
 fn emit_failed(app: &AppHandle, db: &Db, scrape_id: &str, error: &str) {

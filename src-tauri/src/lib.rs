@@ -9,11 +9,17 @@ mod events;
 mod runtime;
 mod settings;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
+use parking_lot::{Mutex, MutexGuard};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -21,7 +27,7 @@ use tauri::{
     AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Position, Rect, Size,
     WindowEvent,
 };
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt, EnvFilter, Layer, Registry};
 
 /// Shared flag that lets commands ask the popover focus-loss handler to skip
 /// the next hide. Used by `open_action_source_in_discord` so the popover can
@@ -43,16 +49,82 @@ const POPOVER_WIDTH: f64 = 380.0;
 const POPOVER_HEIGHT: f64 = 520.0;
 const POPOVER_TRAY_GAP: f64 = 4.0;
 
+#[derive(Clone)]
+struct SharedLogFile(Arc<Mutex<File>>);
+
+struct SharedLogFileWriter<'writer>(MutexGuard<'writer, File>);
+
+impl<'writer> MakeWriter<'writer> for SharedLogFile {
+    type Writer = SharedLogFileWriter<'writer>;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        SharedLogFileWriter(self.0.lock())
+    }
+}
+
+impl Write for SharedLogFileWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+fn init_logging(app: &AppHandle) -> (Option<PathBuf>, Option<String>) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,crumb=debug"));
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(io::stderr)
+        .with_filter(filter.clone());
+
+    match open_log_file(app) {
+        Ok((log_path, file)) => {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(SharedLogFile(Arc::new(Mutex::new(file))))
+                .with_filter(filter);
+            let init_result = tracing::subscriber::set_global_default(
+                Registry::default().with(stderr_layer).with(file_layer),
+            );
+            let init_error = init_result
+                .err()
+                .map(|error| format!("initializing tracing subscriber: {error}"));
+            (Some(log_path), init_error)
+        }
+        Err(error) => {
+            let init_result =
+                tracing::subscriber::set_global_default(Registry::default().with(stderr_layer));
+            let message = init_result.err().map_or_else(
+                || format!("opening app log file: {error}"),
+                |init_error| {
+                    format!(
+                        "opening app log file: {error}; initializing tracing subscriber: {init_error}"
+                    )
+                },
+            );
+            (None, Some(message))
+        }
+    }
+}
+
+fn open_log_file(app: &AppHandle) -> io::Result<(PathBuf, File)> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join("crumb.log");
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    Ok((log_path, file))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,crumb=debug")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -79,6 +151,20 @@ pub fn run() {
             commands::set_launch_at_login,
         ])
         .setup(|app| {
+            let (log_path, log_error) = init_logging(app.handle());
+            if let Some(path) = &log_path {
+                tracing::info!(
+                    path = %path.display(),
+                    "writing Crumb logs to app log file"
+                );
+            }
+            if let Some(error) = &log_error {
+                tracing::warn!(
+                    error = %error,
+                    "Crumb log file setup had a problem; stderr logging remains available"
+                );
+            }
+
             // Menubar app: no Dock icon, no menu bar.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
