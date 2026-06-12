@@ -119,6 +119,7 @@ pub fn run() {
             commands::delete_source,
             commands::open_action_source_in_discord,
             commands::list_action_items,
+            commands::create_manual_action_item,
             commands::set_action_item_status,
             commands::set_action_item_assignee,
             commands::get_sidecar_status,

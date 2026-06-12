@@ -215,6 +215,56 @@ impl Db {
         self.list_action_items("open")
     }
 
+    pub fn create_manual_action(&self, title: &str) -> Result<CanonicalActionItem> {
+        let title = title.trim();
+        if title.is_empty() {
+            bail!("manual action item title is required");
+        }
+        if title.chars().count() > 500 {
+            bail!("manual action item title must be 500 characters or fewer");
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let evidence_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp_millis();
+        let source_scope = format!("manual:{id}");
+        let source_label = "Manual";
+        let dedupe_key = format!("manual:{id}");
+        let evidence_key = format!("manual:{id}");
+
+        let mut conn = self.inner.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO canonical_action_items (
+               id, title, status, source_kind, source_scope, source_label, dedupe_key,
+               priority, relevance_score, first_seen_at, last_seen_at
+             )
+             VALUES (?, ?, 'inbox', 'manual', ?, ?, ?, 0, 0, ?, ?)",
+            rusqlite::params![id, title, source_scope, source_label, dedupe_key, now, now],
+        )?;
+        tx.execute(
+            "INSERT INTO action_item_evidence (
+               id, action_item_id, source_kind, source_id, source_label, scrape_id,
+               extracted_text, context, message_ids, evidence_key, created_at
+             )
+             VALUES (?, ?, 'manual', ?, ?, NULL, ?, NULL, '[]', ?, ?)",
+            rusqlite::params![
+                evidence_id,
+                id,
+                source_scope,
+                source_label,
+                title,
+                evidence_key,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        drop(conn);
+
+        self.get_canonical_action(&id)?
+            .context("manual action item vanished after insert")
+    }
+
     pub fn discord_source_for_action(&self, action_id: &str) -> Result<Option<DiscordSource>> {
         let conn = self.inner.lock();
         let source: Option<(String, String)> = conn
@@ -2096,6 +2146,53 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].evidence_count, 1);
         assert_eq!(actions[0].assignee_key.as_deref(), Some("discord:user:fox"));
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_actions_are_created_as_open_canonical_items() -> Result<()> {
+        let db_path =
+            std::env::temp_dir().join(format!("crumb-manual-action-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&db_path)?;
+
+        let created = db.create_manual_action("  Write launch notes  ")?;
+        assert_eq!(created.title, "Write launch notes");
+        assert_eq!(created.status, "inbox");
+        assert_eq!(created.source_kind, "manual");
+        assert!(created.source_scope.starts_with("manual:"));
+        assert_eq!(created.source_label.as_deref(), Some("Manual"));
+        assert_eq!(created.evidence_count, 1);
+
+        let actions = db.list_open_action_items()?;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].id, created.id);
+        assert!(db.create_manual_action("   ").is_err());
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn similar_manual_actions_survive_startup_consolidation() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-manual-action-consolidation-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let db = Db::open(&db_path)?;
+            db.create_manual_action("Write launch notes")?;
+            db.create_manual_action("Write launch notes for app")?;
+            assert_eq!(db.list_open_action_items()?.len(), 2);
+        }
+
+        let db = Db::open(&db_path)?;
+        let actions = db.list_open_action_items()?;
+        assert_eq!(actions.len(), 2);
+        assert!(actions
+            .iter()
+            .all(|action| action.source_label.as_deref() == Some("Manual")));
 
         let _ = std::fs::remove_file(db_path);
         Ok(())

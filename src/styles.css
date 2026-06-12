@@ -89,6 +89,7 @@ body {
   color: var(--fg);
 }
 
+.popover__add-action,
 .popover__settings {
   display: inline-flex;
   align-items: center;
@@ -107,11 +108,23 @@ body {
   -webkit-app-region: no-drag;
 }
 
+.popover__add-action {
+  font-size: 18px;
+  font-weight: 400;
+}
+
+.popover__add-action--active {
+  border-color: rgba(245, 158, 11, 0.42);
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--fg);
+}
+
 .popover__settings-icon {
   font-size: 18px;
   line-height: 1;
 }
 
+.popover__add-action:hover,
 .popover__settings:hover {
   background: var(--bg-hover);
   color: var(--fg);
@@ -139,6 +152,60 @@ body {
 }
 
 /* actions */
+.actions__quick-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.actions__quick-add input {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 0 9px;
+}
+
+.actions__quick-add input::placeholder {
+  color: var(--fg-muted);
+}
+
+.actions__quick-add button {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(245, 158, 11, 0.42);
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.actions__quick-add button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.actions__quick-add button:not(:disabled):hover {
+  background: rgba(245, 158, 11, 0.2);
+}
+
+.actions__quick-add-error {
+  grid-column: 1 / -1;
+  color: #fca5a5;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 .actions__filters {
   position: sticky;
   top: 0;
@@ -356,6 +423,15 @@ body {
   font-size: 11px;
   overflow: hidden;
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.action-list__source-label {
+  min-width: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

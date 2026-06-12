@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  createManualActionItem,
   deleteSource,
   getScrape,
   getSidecarStatus,
@@ -49,6 +50,7 @@ export default function App() {
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ScrapeDetail | null>(null);
   const [status, setStatus] = useState<SidecarStatus>({ kind: "starting" });
+  const [manualAddOpen, setManualAddOpen] = useState(false);
   const personFilter = storedPersonFilter.key;
   const actionSortForStatus =
     actionStatusFilter === "dismissed" ? "newest" : actionSort;
@@ -178,6 +180,24 @@ export default function App() {
       .catch(console.error);
   };
 
+  const addManualAction = async (title: string) => {
+    const allPeople = { key: "all", label: null };
+    setActionStatusFilter("open");
+    setStoredPersonFilter(allPeople);
+    writeStoredPersonFilter(allPeople);
+
+    await createManualActionItem(title);
+    const nextActions = await listActionItems("open", actionSort);
+    setActions(nextActions);
+    setManualAddOpen(false);
+  };
+
+  const toggleManualAdd = () => {
+    setSelectedId(null);
+    setView("actions");
+    setManualAddOpen((current) => (view === "actions" ? !current : true));
+  };
+
   const openActionSource = (item: CanonicalActionItem) => {
     if (item.sourceKind !== "discord") return;
     setSelectedId(`${item.sourceKind}:${item.sourceScope}`);
@@ -242,6 +262,19 @@ export default function App() {
           </button>
         </nav>
         <button
+          className={
+            manualAddOpen && view === "actions"
+              ? "popover__add-action popover__add-action--active"
+              : "popover__add-action"
+          }
+          onClick={toggleManualAdd}
+          aria-label="Add action item"
+          aria-expanded={manualAddOpen && view === "actions"}
+          title="Add action item"
+        >
+          +
+        </button>
+        <button
           className="popover__settings"
           onClick={openSettings}
           aria-label="Settings"
@@ -267,6 +300,7 @@ export default function App() {
         ) : view === "actions" ? (
           <ActionList
             actions={filteredActions}
+            isManualAddOpen={manualAddOpen}
             statusFilter={actionStatusFilter}
             actionSort={actionSort}
             personFilter={personFilter}
@@ -278,6 +312,7 @@ export default function App() {
             onSourceView={viewActionSource}
             onUrlOpen={openActionUrl}
             onAssigneeChange={changeActionAssignee}
+            onManualAdd={addManualAction}
             onDismiss={dismissAction}
             onRestore={restoreAction}
           />
