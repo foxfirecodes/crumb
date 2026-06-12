@@ -9,9 +9,12 @@ mod events;
 mod runtime;
 mod settings;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use tauri::{
@@ -39,9 +42,59 @@ impl PopoverHideGuard {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct TrayUnreadState {
+    inner: parking_lot::Mutex<TrayUnreadInner>,
+}
+
+#[derive(Debug, Default)]
+struct TrayUnreadInner {
+    initialized: bool,
+    known_open_action_ids: HashSet<String>,
+    has_unread_actions: bool,
+}
+
+impl TrayUnreadState {
+    fn mark_seen(&self, open_action_ids: HashSet<String>) {
+        let mut inner = self.inner.lock();
+        inner.initialized = true;
+        inner.known_open_action_ids = open_action_ids;
+        inner.has_unread_actions = false;
+    }
+
+    fn clear_unread(&self) {
+        let mut inner = self.inner.lock();
+        inner.has_unread_actions = false;
+    }
+
+    fn observe_open_actions(
+        &self,
+        open_action_ids: HashSet<String>,
+        mark_new_as_seen: bool,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner.initialized || mark_new_as_seen {
+            inner.initialized = true;
+            inner.known_open_action_ids = open_action_ids;
+            inner.has_unread_actions = false;
+            return false;
+        }
+
+        if open_action_ids
+            .iter()
+            .any(|id| !inner.known_open_action_ids.contains(id))
+        {
+            inner.has_unread_actions = true;
+        }
+        inner.known_open_action_ids = open_action_ids;
+        inner.has_unread_actions
+    }
+}
+
 const POPOVER_WIDTH: f64 = 380.0;
 const POPOVER_HEIGHT: f64 = 520.0;
 const POPOVER_TRAY_GAP: f64 = 4.0;
+const TRAY_ID: &str = "main";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -87,6 +140,18 @@ pub fn run() {
             let database = db::Db::open(&db_path)?;
             app.manage(database.clone());
 
+            let tray_unread_state = TrayUnreadState::default();
+            match database.list_open_action_items() {
+                Ok(actions) => {
+                    tray_unread_state.mark_seen(action_ids(&actions));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to seed tray unread state: {e}");
+                    tray_unread_state.mark_seen(HashSet::new());
+                }
+            }
+            app.manage(tray_unread_state);
+
             let runtime = runtime::RuntimeManager::start(app.handle().clone(), database)?;
             app.manage(runtime);
 
@@ -100,8 +165,8 @@ pub fn run() {
                 ])
                 .build()?;
 
-            let tray_icon = Image::from_bytes(include_bytes!("../icons/tray.png"))?;
-            TrayIconBuilder::with_id("main")
+            let tray_icon = tray_icon_image()?;
+            TrayIconBuilder::with_id(TRAY_ID)
                 .icon(tray_icon)
                 .icon_as_template(true)
                 .menu(&tray_menu)
@@ -132,6 +197,7 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            set_tray_unread_indicator(&app.handle(), false);
 
             // Hide popover on focus loss so it behaves like a real menubar dropdown.
             if let Some(win) = app.get_webview_window("popover") {
@@ -194,6 +260,7 @@ fn toggle_popover(
     win.set_position(logical)?;
     win.show()?;
     win.set_focus()?;
+    mark_tray_actions_seen(app);
     Ok(())
 }
 
@@ -259,7 +326,123 @@ fn show_popover_centered(app: &AppHandle) -> tauri::Result<()> {
     win.center()?;
     win.show()?;
     win.set_focus()?;
+    mark_tray_actions_seen(app);
     Ok(())
+}
+
+pub fn observe_tray_action_items(app: &AppHandle, actions: &[events::CanonicalActionItem]) {
+    let Some(state) = app.try_state::<TrayUnreadState>() else {
+        return;
+    };
+    let has_unread = state.observe_open_actions(action_ids(actions), is_popover_visible(app));
+    set_tray_unread_indicator(app, has_unread);
+}
+
+fn mark_tray_actions_seen(app: &AppHandle) {
+    let Some(state) = app.try_state::<TrayUnreadState>() else {
+        return;
+    };
+    match app.try_state::<db::Db>() {
+        Some(db) => match db.list_open_action_items() {
+            Ok(actions) => state.mark_seen(action_ids(&actions)),
+            Err(e) => {
+                tracing::warn!("failed to mark tray actions seen: {e}");
+                state.clear_unread();
+            }
+        },
+        None => state.clear_unread(),
+    }
+    set_tray_unread_indicator(app, false);
+}
+
+fn is_popover_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("popover")
+        .and_then(|win| win.is_visible().ok())
+        .unwrap_or(false)
+}
+
+fn action_ids(actions: &[events::CanonicalActionItem]) -> HashSet<String> {
+    actions.iter().map(|action| action.id.clone()).collect()
+}
+
+fn set_tray_unread_indicator(app: &AppHandle, has_unread: bool) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let icon = if has_unread {
+        unread_tray_icon_image()
+    } else {
+        tray_icon_image()
+    };
+    match icon {
+        Ok(icon) => {
+            if let Err(e) = tray.set_icon_with_as_template(Some(icon), true) {
+                tracing::warn!("failed to update tray icon: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("failed to build tray icon: {e}"),
+    }
+    let tooltip = if has_unread {
+        "Crumb - new action items"
+    } else {
+        "Crumb"
+    };
+    if let Err(e) = tray.set_tooltip(Some(tooltip)) {
+        tracing::warn!("failed to update tray tooltip: {e}");
+    }
+}
+
+fn tray_icon_image() -> tauri::Result<Image<'static>> {
+    Image::from_bytes(include_bytes!("../icons/tray.png"))
+}
+
+fn unread_tray_icon_image() -> tauri::Result<Image<'static>> {
+    let base = tray_icon_image()?;
+    let width = base.width();
+    let height = base.height();
+    let mut rgba = base.rgba().to_vec();
+    draw_unread_dot(&mut rgba, width, height);
+    Ok(Image::new_owned(rgba, width, height))
+}
+
+fn draw_unread_dot(rgba: &mut [u8], width: u32, height: u32) {
+    let scale = (width.min(height) as f32 / 44.0).max(0.5);
+    let center_x = width as f32 - 8.0 * scale;
+    let center_y = 8.0 * scale;
+    let clear_radius = 7.6 * scale;
+    let dot_radius = 5.6 * scale;
+
+    for y in 0..height {
+        for x in 0..width {
+            let distance = pixel_distance(x, y, center_x, center_y);
+            let idx = ((y * width + x) * 4) as usize;
+            if distance <= clear_radius {
+                let edge = ((distance - (clear_radius - scale)) / scale).clamp(0.0, 1.0);
+                rgba[idx + 3] = (rgba[idx + 3] as f32 * edge).round() as u8;
+            }
+        }
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let distance = pixel_distance(x, y, center_x, center_y);
+            if distance > dot_radius {
+                continue;
+            }
+            let edge = ((dot_radius - distance) / scale).clamp(0.0, 1.0);
+            let idx = ((y * width + x) * 4) as usize;
+            rgba[idx] = 0;
+            rgba[idx + 1] = 0;
+            rgba[idx + 2] = 0;
+            rgba[idx + 3] = rgba[idx + 3].max((255.0 * edge).round() as u8);
+        }
+    }
+}
+
+fn pixel_distance(x: u32, y: u32, center_x: f32, center_y: f32) -> f32 {
+    let dx = x as f32 + 0.5 - center_x;
+    let dy = y as f32 + 0.5 - center_y;
+    (dx * dx + dy * dy).sqrt()
 }
 
 pub fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
@@ -308,4 +491,52 @@ fn graceful_exit(app: &AppHandle) {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         app.exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn tray_unread_state_seeds_without_marking_existing_actions_unread() {
+        let state = TrayUnreadState::default();
+
+        assert!(!state.observe_open_actions(ids(&["a", "b"]), false));
+        assert!(!state.observe_open_actions(ids(&["a", "b"]), false));
+    }
+
+    #[test]
+    fn tray_unread_state_marks_new_open_action_ids_unread() {
+        let state = TrayUnreadState::default();
+
+        state.mark_seen(ids(&["a"]));
+
+        assert!(state.observe_open_actions(ids(&["a", "b"]), false));
+        assert!(state.observe_open_actions(ids(&["b"]), false));
+    }
+
+    #[test]
+    fn tray_unread_state_can_mark_current_actions_seen() {
+        let state = TrayUnreadState::default();
+
+        state.mark_seen(ids(&["a"]));
+        assert!(state.observe_open_actions(ids(&["a", "b"]), false));
+
+        state.mark_seen(ids(&["a", "b"]));
+        assert!(!state.observe_open_actions(ids(&["a", "b"]), false));
+    }
+
+    #[test]
+    fn tray_unread_state_treats_visible_popover_updates_as_seen() {
+        let state = TrayUnreadState::default();
+
+        state.mark_seen(ids(&["a"]));
+
+        assert!(!state.observe_open_actions(ids(&["a", "b"]), true));
+        assert!(!state.observe_open_actions(ids(&["a", "b"]), false));
+    }
 }
