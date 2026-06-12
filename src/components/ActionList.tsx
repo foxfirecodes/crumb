@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { type FormEvent, useState } from "react";
 import type {
   CanonicalActionItem,
   ActionItemStatusFilter,
@@ -28,6 +28,7 @@ interface Props {
     assignee: string | null,
     assigneeKey: string | null,
   ) => void;
+  onManualAdd: (title: string) => Promise<void>;
   onDismiss: (id: string) => void;
   onRestore: (id: string) => void;
 }
@@ -55,6 +56,7 @@ export function ActionList({
   onSourceView,
   onUrlOpen,
   onAssigneeChange,
+  onManualAdd,
   onDismiss,
   onRestore,
 }: Props) {
@@ -63,12 +65,51 @@ export function ActionList({
   const [assigneeDrafts, setAssigneeDrafts] = useState<Record<string, string>>(
     {},
   );
+  const [manualDraft, setManualDraft] = useState("");
+  const [manualPending, setManualPending] = useState(false);
+  const [manualError, setManualError] = useState<string | null>(null);
   const toggleExpanded = (id: string) => {
     setExpandedId((current) => (current === id ? null : id));
   };
 
+  const submitManualAction = (event: FormEvent) => {
+    event.preventDefault();
+    const title = manualDraft.trim();
+    if (!title || manualPending) return;
+
+    setManualPending(true);
+    setManualError(null);
+    onManualAdd(title)
+      .then(() => setManualDraft(""))
+      .catch((error: unknown) => {
+        setManualError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setManualPending(false));
+  };
+
   return (
     <div className="actions">
+      <form className="actions__quick-add" onSubmit={submitManualAction}>
+        <input
+          value={manualDraft}
+          placeholder="New action item"
+          aria-label="New action item"
+          onChange={(event) => setManualDraft(event.currentTarget.value)}
+        />
+        <button
+          type="submit"
+          disabled={!manualDraft.trim() || manualPending}
+          aria-label="Add action item"
+          title="Add action item"
+        >
+          {manualPending ? "Adding" : "Add"}
+        </button>
+        {manualError && (
+          <div className="actions__quick-add-error" role="alert">
+            {manualError}
+          </div>
+        )}
+      </form>
       <div className="actions__filters">
         <div className="actions__status" aria-label="Action item status">
           <button
@@ -306,9 +347,15 @@ function ActionItemDetails({
     <div className="action-list__details">
       <div className="action-list__detail-row">
         <span>Source</span>
-        <button className="action-list__source" onClick={onSourceOpen}>
-          {item.sourceLabel ?? item.sourceKind}
-        </button>
+        {item.sourceKind === "discord" ? (
+          <button className="action-list__source" onClick={onSourceOpen}>
+            {item.sourceLabel ?? item.sourceKind}
+          </button>
+        ) : (
+          <span className="action-list__source-label">
+            {item.sourceLabel ?? item.sourceKind}
+          </span>
+        )}
       </div>
       {item.url && (
         <div className="action-list__detail-row">

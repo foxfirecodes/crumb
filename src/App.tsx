@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  createManualActionItem,
   deleteSource,
   getScrape,
   getSidecarStatus,
@@ -178,6 +179,17 @@ export default function App() {
       .catch(console.error);
   };
 
+  const addManualAction = async (title: string) => {
+    const allPeople = { key: "all", label: null };
+    setActionStatusFilter("open");
+    setStoredPersonFilter(allPeople);
+    writeStoredPersonFilter(allPeople);
+
+    await createManualActionItem(title);
+    const nextActions = await listActionItems("open", actionSort);
+    setActions(nextActions);
+  };
+
   const openActionSource = (item: CanonicalActionItem) => {
     if (item.sourceKind !== "discord") return;
     setSelectedId(`${item.sourceKind}:${item.sourceScope}`);
@@ -278,6 +290,7 @@ export default function App() {
             onSourceView={viewActionSource}
             onUrlOpen={openActionUrl}
             onAssigneeChange={changeActionAssignee}
+            onManualAdd={addManualAction}
             onDismiss={dismissAction}
             onRestore={restoreAction}
           />
