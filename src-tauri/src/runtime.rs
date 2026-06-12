@@ -708,6 +708,7 @@ async fn extract_and_store(
 
     let _ = app.emit("scrape:updated", &updated);
     if let Ok(actions) = db.list_open_action_items() {
+        crate::observe_tray_action_items(app, &actions);
         let _ = app.emit("actions:updated", &actions);
     }
 

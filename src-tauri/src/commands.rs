@@ -26,6 +26,7 @@ pub fn get_scrape(id: String, db: State<'_, Db>) -> Result<Option<ScrapeDetail>,
 pub fn delete_source(id: String, app: AppHandle, db: State<'_, Db>) -> Result<(), String> {
     db.delete_source(&id).map_err(|e| e.to_string())?;
     if let Ok(items) = db.list_open_action_items() {
+        crate::observe_tray_action_items(&app, &items);
         let _ = app.emit("actions:updated", &items);
     }
     Ok(())
@@ -89,6 +90,7 @@ pub fn set_action_item_status(
         .set_action_status(&id, &status)
         .map_err(|e| e.to_string())?;
     if let Ok(items) = db.list_open_action_items() {
+        crate::observe_tray_action_items(&app, &items);
         let _ = app.emit("actions:updated", &items);
     }
     Ok(updated)
@@ -106,6 +108,7 @@ pub fn set_action_item_assignee(
         .set_action_assignee(&id, assignee_key.as_deref(), assignee.as_deref())
         .map_err(|e| e.to_string())?;
     if let Ok(items) = db.list_open_action_items() {
+        crate::observe_tray_action_items(&app, &items);
         let _ = app.emit("actions:updated", &items);
     }
     Ok(updated)
