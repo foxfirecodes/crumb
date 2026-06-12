@@ -409,8 +409,8 @@ fn draw_unread_dot(rgba: &mut [u8], width: u32, height: u32) {
     let scale = (width.min(height) as f32 / 44.0).max(0.5);
     let center_x = width as f32 - 8.0 * scale;
     let center_y = 8.0 * scale;
-    let clear_radius = 6.0 * scale;
-    let dot_radius = 3.6 * scale;
+    let clear_radius = 7.6 * scale;
+    let dot_radius = 5.6 * scale;
 
     for y in 0..height {
         for x in 0..width {
