@@ -89,6 +89,7 @@ body {
   color: var(--fg);
 }
 
+.popover__add-action,
 .popover__settings {
   display: inline-flex;
   align-items: center;
@@ -107,11 +108,23 @@ body {
   -webkit-app-region: no-drag;
 }
 
+.popover__add-action {
+  font-size: 18px;
+  font-weight: 400;
+}
+
+.popover__add-action--active {
+  border-color: rgba(245, 158, 11, 0.42);
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--fg);
+}
+
 .popover__settings-icon {
   font-size: 18px;
   line-height: 1;
 }
 
+.popover__add-action:hover,
 .popover__settings:hover {
   background: var(--bg-hover);
   color: var(--fg);

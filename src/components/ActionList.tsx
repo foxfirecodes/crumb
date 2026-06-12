@@ -1,4 +1,4 @@
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import type {
   CanonicalActionItem,
   ActionItemStatusFilter,
@@ -13,6 +13,7 @@ interface PersonOption {
 
 interface Props {
   actions: CanonicalActionItem[];
+  isManualAddOpen: boolean;
   statusFilter: ActionItemStatusFilter;
   actionSort: ActionItemSort;
   personFilter: string;
@@ -45,6 +46,7 @@ const formatTime = (ts: number) => {
 
 export function ActionList({
   actions,
+  isManualAddOpen,
   statusFilter,
   actionSort,
   personFilter,
@@ -68,9 +70,16 @@ export function ActionList({
   const [manualDraft, setManualDraft] = useState("");
   const [manualPending, setManualPending] = useState(false);
   const [manualError, setManualError] = useState<string | null>(null);
+  const manualInputRef = useRef<HTMLInputElement | null>(null);
   const toggleExpanded = (id: string) => {
     setExpandedId((current) => (current === id ? null : id));
   };
+
+  useEffect(() => {
+    if (isManualAddOpen) {
+      manualInputRef.current?.focus();
+    }
+  }, [isManualAddOpen]);
 
   const submitManualAction = (event: FormEvent) => {
     event.preventDefault();
@@ -89,27 +98,30 @@ export function ActionList({
 
   return (
     <div className="actions">
-      <form className="actions__quick-add" onSubmit={submitManualAction}>
-        <input
-          value={manualDraft}
-          placeholder="New action item"
-          aria-label="New action item"
-          onChange={(event) => setManualDraft(event.currentTarget.value)}
-        />
-        <button
-          type="submit"
-          disabled={!manualDraft.trim() || manualPending}
-          aria-label="Add action item"
-          title="Add action item"
-        >
-          {manualPending ? "Adding" : "Add"}
-        </button>
-        {manualError && (
-          <div className="actions__quick-add-error" role="alert">
-            {manualError}
-          </div>
-        )}
-      </form>
+      {isManualAddOpen && (
+        <form className="actions__quick-add" onSubmit={submitManualAction}>
+          <input
+            ref={manualInputRef}
+            value={manualDraft}
+            placeholder="New action item"
+            aria-label="New action item"
+            onChange={(event) => setManualDraft(event.currentTarget.value)}
+          />
+          <button
+            type="submit"
+            disabled={!manualDraft.trim() || manualPending}
+            aria-label="Add action item"
+            title="Add action item"
+          >
+            {manualPending ? "Adding" : "Add"}
+          </button>
+          {manualError && (
+            <div className="actions__quick-add-error" role="alert">
+              {manualError}
+            </div>
+          )}
+        </form>
+      )}
       <div className="actions__filters">
         <div className="actions__status" aria-label="Action item status">
           <button
