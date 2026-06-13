@@ -9,11 +9,11 @@ const COLOR: Record<SidecarStatus["kind"], string> = {
 };
 
 const LABEL: Record<SidecarStatus["kind"], string> = {
-  starting: "starting",
-  needssetup: "setup",
-  connected: "connected",
-  disconnected: "disconnected",
-  error: "error",
+  starting: "Starting",
+  needssetup: "Setup",
+  connected: "Connected",
+  disconnected: "Disconnected",
+  error: "Error",
 };
 
 export function StatusDot({ status }: { status: SidecarStatus }) {
