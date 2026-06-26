@@ -82,10 +82,14 @@ pub fn list_action_items(
 #[tauri::command]
 pub fn create_manual_action_item(
     title: String,
+    assignee_key: Option<String>,
+    assignee: Option<String>,
     app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<CanonicalActionItem, String> {
-    let created = db.create_manual_action(&title).map_err(|e| e.to_string())?;
+    let created = db
+        .create_manual_action(&title, assignee_key.as_deref(), assignee.as_deref())
+        .map_err(|e| e.to_string())?;
     if let Ok(items) = db.list_open_action_items() {
         crate::observe_tray_action_items(&app, &items);
         let _ = app.emit("actions:updated", &items);

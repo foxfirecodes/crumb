@@ -23,8 +23,16 @@ export const listActionItems = (
   statusFilter: ActionItemStatusFilter,
   sort: ActionItemSort,
 ) => invoke<CanonicalActionItem[]>("list_action_items", { statusFilter, sort });
-export const createManualActionItem = (title: string) =>
-  invoke<CanonicalActionItem>("create_manual_action_item", { title });
+export const createManualActionItem = (
+  title: string,
+  assignee: string | null = null,
+  assigneeKey: string | null = null,
+) =>
+  invoke<CanonicalActionItem>("create_manual_action_item", {
+    title,
+    assignee,
+    assigneeKey,
+  });
 export const setActionItemStatus = (
   id: string,
   status: CanonicalActionStatus,

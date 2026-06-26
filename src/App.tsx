@@ -181,12 +181,21 @@ export default function App() {
   };
 
   const addManualAction = async (title: string) => {
-    const allPeople = { key: "all", label: null };
+    const selectedAssignee =
+      personFilter === "all"
+        ? null
+        : personOptions.find((person) => person.key === personFilter) ?? {
+            key: personFilter,
+            label: storedPersonFilter.label ?? personFilter,
+            count: 0,
+          };
     setActionStatusFilter("open");
-    setStoredPersonFilter(allPeople);
-    writeStoredPersonFilter(allPeople);
 
-    await createManualActionItem(title);
+    await createManualActionItem(
+      title,
+      selectedAssignee?.label ?? null,
+      selectedAssignee?.key ?? null,
+    );
     const nextActions = await listActionItems("open", actionSort);
     setActions(nextActions);
     setManualAddOpen(false);
