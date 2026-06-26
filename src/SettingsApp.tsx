@@ -8,16 +8,39 @@ import {
   testAiSettings,
   testDiscordSettings,
 } from "./lib/ipc";
-import type { AppSettings, SettingsTestResult } from "./lib/types";
+import type { AcpConnector, AppSettings, SettingsTestResult } from "./lib/types";
+
+const DEFAULT_CLAUDE_COMMAND =
+  "npx -y @agentclientprotocol/claude-agent-acp@0.33.1";
+const DEFAULT_CODEX_COMMAND = "npx -y @agentclientprotocol/codex-acp@0.0.44";
+
+const CONNECTORS: { value: AcpConnector; label: string }[] = [
+  { value: "claudeCode", label: "Claude Code" },
+  { value: "codex", label: "Codex" },
+  { value: "custom", label: "Custom" },
+];
 
 const EMPTY_SETTINGS: AppSettings = {
   discordAppId: "",
   discordBotToken: "",
   discordUserToken: "",
-  aiModel: "sonnet",
-  aiEffort: "low",
-  claudeConfigDir: "",
-  acpAgentCommand: "",
+  acpConnector: "claudeCode",
+  claudeCode: {
+    model: "sonnet",
+    effort: "low",
+    configDir: "",
+    command: "",
+  },
+  codex: {
+    model: "gpt-5.4-mini",
+    effort: "low",
+    command: "",
+  },
+  customAcp: {
+    command: "",
+    env: "",
+    sessionMeta: "",
+  },
   keepPopoverOpenOnView: false,
 };
 
@@ -67,6 +90,30 @@ export default function SettingsApp() {
     value: AppSettings[K],
   ) => {
     setSettings((current) => ({ ...current, [key]: value }));
+    setSaveState("idle");
+    setMessage(null);
+    setDiscordTestResult(null);
+    setAiTestResult(null);
+  };
+
+  const updateConnector = (connector: AcpConnector) => {
+    update("acpConnector", connector);
+  };
+
+  const updateNested = <
+    Section extends "claudeCode" | "codex" | "customAcp",
+  >(
+    section: Section,
+    key: keyof AppSettings[Section],
+    value: string,
+  ) => {
+    setSettings((current) => ({
+      ...current,
+      [section]: {
+        ...current[section],
+        [key]: value,
+      },
+    }));
     setSaveState("idle");
     setMessage(null);
     setDiscordTestResult(null);
@@ -218,46 +265,155 @@ export default function SettingsApp() {
               {aiTestResult.message}
             </div>
           )}
-          <div className="settings-grid">
-            <label className="settings-field">
-              <span>Model</span>
-              <select
-                value={settings.aiModel}
-                onChange={(e) => update("aiModel", e.target.value)}
+          <div className="settings-segmented" role="tablist">
+            {CONNECTORS.map((connector) => (
+              <button
+                key={connector.value}
+                type="button"
+                className={
+                  settings.acpConnector === connector.value
+                    ? "settings-segmented__option settings-segmented__option--active"
+                    : "settings-segmented__option"
+                }
+                onClick={() => updateConnector(connector.value)}
               >
-                <option value="sonnet">sonnet</option>
-                <option value="haiku">haiku</option>
-              </select>
-            </label>
-            <label className="settings-field">
-              <span>Effort</span>
-              <select
-                value={settings.aiEffort}
-                onChange={(e) => update("aiEffort", e.target.value)}
-              >
-                <option value="low">low</option>
-                <option value="medium">medium</option>
-                <option value="high">high</option>
-                <option value="xhigh">xhigh</option>
-              </select>
-            </label>
+                {connector.label}
+              </button>
+            ))}
           </div>
-          <label className="settings-field">
-            <span>Claude config dir</span>
-            <input
-              value={settings.claudeConfigDir}
-              onChange={(e) => update("claudeConfigDir", e.target.value)}
-              placeholder="~/.claude"
-            />
-          </label>
-          <label className="settings-field">
-            <span>ACP command</span>
-            <input
-              value={settings.acpAgentCommand}
-              onChange={(e) => update("acpAgentCommand", e.target.value)}
-              placeholder="bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'"
-            />
-          </label>
+
+          {settings.acpConnector === "claudeCode" && (
+            <>
+              <div className="settings-grid">
+                <label className="settings-field">
+                  <span>Model</span>
+                  <select
+                    value={settings.claudeCode.model}
+                    onChange={(e) =>
+                      updateNested("claudeCode", "model", e.target.value)
+                    }
+                  >
+                    <option value="sonnet">sonnet</option>
+                    <option value="haiku">haiku</option>
+                  </select>
+                </label>
+                <label className="settings-field">
+                  <span>Effort</span>
+                  <select
+                    value={settings.claudeCode.effort}
+                    onChange={(e) =>
+                      updateNested("claudeCode", "effort", e.target.value)
+                    }
+                  >
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                  </select>
+                </label>
+              </div>
+              <label className="settings-field">
+                <span>Claude config dir</span>
+                <input
+                  value={settings.claudeCode.configDir}
+                  onChange={(e) =>
+                    updateNested("claudeCode", "configDir", e.target.value)
+                  }
+                  placeholder="~/.claude"
+                />
+              </label>
+              <label className="settings-field">
+                <span>ACP command</span>
+                <input
+                  value={settings.claudeCode.command}
+                  onChange={(e) =>
+                    updateNested("claudeCode", "command", e.target.value)
+                  }
+                  placeholder={DEFAULT_CLAUDE_COMMAND}
+                />
+              </label>
+            </>
+          )}
+
+          {settings.acpConnector === "codex" && (
+            <>
+              <div className="settings-grid">
+                <label className="settings-field">
+                  <span>Model</span>
+                  <select
+                    value={settings.codex.model}
+                    onChange={(e) =>
+                      updateNested("codex", "model", e.target.value)
+                    }
+                  >
+                    <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                    <option value="gpt-5.4">gpt-5.4</option>
+                    <option value="gpt-5.5">gpt-5.5</option>
+                  </select>
+                </label>
+                <label className="settings-field">
+                  <span>Effort</span>
+                  <select
+                    value={settings.codex.effort}
+                    onChange={(e) =>
+                      updateNested("codex", "effort", e.target.value)
+                    }
+                  >
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                  </select>
+                </label>
+              </div>
+              <label className="settings-field">
+                <span>ACP command</span>
+                <input
+                  value={settings.codex.command}
+                  onChange={(e) =>
+                    updateNested("codex", "command", e.target.value)
+                  }
+                  placeholder={DEFAULT_CODEX_COMMAND}
+                />
+              </label>
+            </>
+          )}
+
+          {settings.acpConnector === "custom" && (
+            <>
+              <label className="settings-field">
+                <span>ACP command</span>
+                <input
+                  value={settings.customAcp.command}
+                  onChange={(e) =>
+                    updateNested("customAcp", "command", e.target.value)
+                  }
+                  placeholder="my-acp-agent"
+                />
+              </label>
+              <label className="settings-field">
+                <span>Environment</span>
+                <textarea
+                  value={settings.customAcp.env}
+                  onChange={(e) =>
+                    updateNested("customAcp", "env", e.target.value)
+                  }
+                  placeholder="KEY=value"
+                />
+              </label>
+              <label className="settings-field">
+                <span>Session metadata JSON</span>
+                <textarea
+                  value={settings.customAcp.sessionMeta}
+                  onChange={(e) =>
+                    updateNested("customAcp", "sessionMeta", e.target.value)
+                  }
+                  placeholder='{"disableBuiltInTools":true}'
+                />
+              </label>
+            </>
+          )}
+
           <button
             className="settings-window__secondary"
             onClick={runAiTest}

@@ -193,8 +193,8 @@ pub async fn test_discord_settings(settings: AppSettings) -> SettingsTestResult 
 }
 
 #[tauri::command]
-pub fn test_ai_settings(settings: AppSettings) -> SettingsTestResult {
-    crate::ai::test_settings(&settings)
+pub async fn test_ai_settings(settings: AppSettings) -> SettingsTestResult {
+    crate::ai::test_settings(&settings).await
 }
 
 #[tauri::command]

@@ -10,7 +10,7 @@ The product direction includes Discord, Asana, Notion, and manual notes. The cur
 
 - **Actions** is the primary view. It shows canonical action items, supports assignee filtering, dismiss/restore, expandable details, source navigation, and assignee edits.
 - **Sources** is the secondary view. It shows Discord sources, scrape summaries, source-local decisions/action candidates, and source deletion for re-scrape testing.
-- Discord `/scrape` fetches messages from a channel or DM, passes normalized content to an ACP/Claude extractor, and reconciles extracted candidates into canonical actions.
+- Discord `/scrape` fetches messages from a channel or DM, passes normalized content to the selected ACP extractor, and reconciles extracted candidates into canonical actions.
 
 ## High-Level Architecture
 
@@ -18,7 +18,7 @@ The product direction includes Discord, Asana, Notion, and manual notes. The cur
 React popover UI
   -> Tauri commands/events
   -> Rust runtime + SQLite
-  -> Discord Gateway/REST + ACP/Claude extraction
+  -> Discord Gateway/REST + ACP extraction
 ```
 
 The frontend is deliberately small and stateful. The Rust side owns ingestion, persistence, extraction orchestration, dedupe, and lifecycle changes.

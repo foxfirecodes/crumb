@@ -80,14 +80,35 @@ export type SidecarStatus =
   | { kind: "disconnected" }
   | { kind: "error"; message: string };
 
+export type AcpConnector = "claudeCode" | "codex" | "custom";
+
+export interface ClaudeCodeSettings {
+  model: string;
+  effort: string;
+  configDir: string;
+  command: string;
+}
+
+export interface CodexSettings {
+  model: string;
+  effort: string;
+  command: string;
+}
+
+export interface CustomAcpSettings {
+  command: string;
+  env: string;
+  sessionMeta: string;
+}
+
 export interface AppSettings {
   discordAppId: string;
   discordBotToken: string;
   discordUserToken: string;
-  aiModel: string;
-  aiEffort: string;
-  claudeConfigDir: string;
-  acpAgentCommand: string;
+  acpConnector: AcpConnector;
+  claudeCode: ClaudeCodeSettings;
+  codex: CodexSettings;
+  customAcp: CustomAcpSettings;
   keepPopoverOpenOnView: boolean;
 }
 
