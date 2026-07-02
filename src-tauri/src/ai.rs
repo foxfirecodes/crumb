@@ -103,6 +103,31 @@ Rules for this mode:
 - Reuse merge_with when this is the same real-world task as an existing action item.
 - Use a stable dedupe_key based on both the selected message id and the user's note."#;
 
+const SUMMARY_MARKDOWN_LIMIT: usize = 1500;
+const SUMMARIZE_PROMPT: &str = r#"You are a concise Discord conversation summarizer.
+
+You receive a chronological transcript from one Discord chat. Extract:
+1. CONCLUSION: what the conversation settled, decided, resolved, or established.
+2. ACTION ITEMS: concrete follow-ups someone should do, with assignee and due date/timeframe when stated.
+
+Rules:
+- Be conservative. Do not invent conclusions or tasks.
+- Prefer the latest settled state when earlier messages were superseded.
+- Use known_people_json and current_user_json to name assignees naturally.
+- Preserve explicit due dates or relative timeframes like "today", "this week", or "next Friday".
+- If there is no clear conclusion, say "No clear conclusion."
+- If there are no action items, say "None."
+- Produce compact GitHub-flavored Markdown with exactly these headings:
+  "Conclusion" and "Action items".
+- Do not include Discord message IDs unless they are necessary to identify an item.
+- Do not include code fences. The app will wrap your markdown in a code block.
+- Keep markdown under 1500 characters.
+- Do not use tools, inspect files, run commands, browse, or ask follow-up questions.
+- Return ONLY JSON matching this shape:
+{
+  "markdown": "string"
+}"#;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtractedDecision {
     pub text: String,
@@ -142,6 +167,11 @@ struct Extraction {
     decisions: Vec<ExtractedDecision>,
     #[serde(default, rename = "action_items")]
     action_items: Vec<ExtractedActionItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryExtraction {
+    markdown: String,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +357,34 @@ pub async fn extract_noted_action(
         decisions: Vec::new(),
         action_items,
     })
+}
+
+pub async fn summarize(
+    messages: &[NormalizedMessage],
+    current_user: Option<&NormalizedPerson>,
+    settings: &AppSettings,
+) -> Result<String> {
+    if messages.is_empty() {
+        return Ok(normalize_summary_markdown(
+            "Conclusion\nNo messages found.\n\nAction items\nNone.",
+        ));
+    }
+
+    let agent = build_acp_agent(settings)?;
+    let response = run_acp_prompt(
+        agent,
+        build_summary_prompt(messages, current_user)?,
+        settings,
+    )
+    .await?;
+    let connector = settings.acp_connector.label();
+    let json = extract_json_object(&response).with_context(|| {
+        format!("{connector} ACP response did not contain a JSON object: {response}")
+    })?;
+    let parsed: SummaryExtraction =
+        serde_json::from_str(json).context("summary extraction schema mismatch")?;
+
+    Ok(normalize_summary_markdown(&parsed.markdown))
 }
 
 async fn run_acp_prompt(
@@ -707,6 +765,21 @@ fn build_noted_action_prompt(
     ))
 }
 
+fn build_summary_prompt(
+    messages: &[NormalizedMessage],
+    current_user: Option<&NormalizedPerson>,
+) -> Result<String> {
+    let current_user = current_user.map(current_user_for_prompt);
+    let current_user_json = serde_json::to_string(&current_user)?;
+    let known_people =
+        serde_json::to_string(&known_people_from_messages(messages, current_user.as_ref()))?;
+
+    Ok(format!(
+        "{SUMMARIZE_PROMPT}\n\nAnalyze this Discord chat transcript and return the compact markdown summary as JSON.\n\n<current_user_json>\n{current_user_json}\n</current_user_json>\n\n<known_people_json>\n{known_people}\n</known_people_json>\n\n<transcript>\n{}\n</transcript>",
+        format_transcript(messages)
+    ))
+}
+
 fn acp_session_meta(settings: &AppSettings) -> Result<Map<String, Value>> {
     match settings.acp_connector {
         AcpConnector::ClaudeCode => Ok(claude_code_session_meta(settings)),
@@ -980,6 +1053,62 @@ fn format_transcript(messages: &[NormalizedMessage]) -> String {
         .join("\n")
 }
 
+fn normalize_summary_markdown(markdown: &str) -> String {
+    let markdown = strip_markdown_code_fence(markdown)
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let markdown = collapse_blank_lines(markdown.trim());
+    let markdown = if markdown.is_empty() {
+        "Conclusion\nNo clear conclusion.\n\nAction items\nNone.".to_string()
+    } else {
+        markdown
+    };
+    truncate_summary_markdown(&markdown, SUMMARY_MARKDOWN_LIMIT)
+}
+
+fn strip_markdown_code_fence(value: &str) -> &str {
+    let trimmed = value.trim();
+    let Some(without_opening) = trimmed
+        .strip_prefix("```markdown")
+        .or_else(|| trimmed.strip_prefix("```md"))
+        .or_else(|| trimmed.strip_prefix("```"))
+    else {
+        return trimmed;
+    };
+    without_opening
+        .strip_suffix("```")
+        .map(str::trim)
+        .unwrap_or(without_opening.trim())
+}
+
+fn collapse_blank_lines(markdown: &str) -> String {
+    let mut lines = Vec::new();
+    let mut last_was_blank = false;
+    for line in markdown.lines() {
+        let is_blank = line.is_empty();
+        if is_blank && last_was_blank {
+            continue;
+        }
+        lines.push(line);
+        last_was_blank = is_blank;
+    }
+    lines.join("\n")
+}
+
+fn truncate_summary_markdown(markdown: &str, limit: usize) -> String {
+    if markdown.chars().count() <= limit {
+        return markdown.to_string();
+    }
+    let suffix = "...";
+    let take = limit.saturating_sub(suffix.chars().count());
+    let mut truncated = markdown.chars().take(take).collect::<String>();
+    truncated.truncate(truncated.trim_end().len());
+    truncated.push_str(suffix);
+    truncated
+}
+
 fn format_message_line(m: &NormalizedMessage) -> String {
     let reply = m
         .reply_to_id
@@ -1187,6 +1316,32 @@ mod tests {
             action.dedupe_key.as_deref(),
             Some("noted-action-123-follow-up-with-ada")
         );
+    }
+
+    #[test]
+    fn summary_prompt_uses_separate_markdown_contract() {
+        let messages = vec![message("1", "Let's ship the patch today.")];
+
+        let prompt = build_summary_prompt(&messages, None).unwrap();
+
+        assert!(prompt.contains("You are a concise Discord conversation summarizer."));
+        assert!(prompt.contains("\"markdown\": \"string\""));
+        assert!(prompt.contains("Do not include code fences."));
+        assert!(prompt.contains("<transcript>\n[2026-05-26T00:00:00Z] [1]"));
+    }
+
+    #[test]
+    fn summary_markdown_is_capped_and_strips_code_fences() {
+        let oversized = format!(
+            "```md\nConclusion\n{}\n\nAction items\nNone.\n```",
+            "a".repeat(SUMMARY_MARKDOWN_LIMIT + 200)
+        );
+
+        let normalized = normalize_summary_markdown(&oversized);
+
+        assert!(normalized.starts_with("Conclusion\naaa"));
+        assert!(normalized.chars().count() <= SUMMARY_MARKDOWN_LIMIT);
+        assert!(!normalized.contains("```"));
     }
 
     #[test]

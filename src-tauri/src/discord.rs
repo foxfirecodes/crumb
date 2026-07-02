@@ -61,6 +61,16 @@ pub struct ScrapeRequest {
 }
 
 #[derive(Debug)]
+pub struct SummaryRequest {
+    pub channel_id: String,
+    pub channel_name: Option<String>,
+    pub guild_name: Option<String>,
+    pub triggered_by: String,
+    pub limit: usize,
+    pub reply: InteractionReply,
+}
+
+#[derive(Debug)]
 pub struct WatchRequest {
     pub interaction_id: String,
     pub channel_id: String,
@@ -74,6 +84,7 @@ pub struct WatchRequest {
 #[derive(Debug)]
 pub enum DiscordCommand {
     Scrape(ScrapeRequest),
+    Summarize(SummaryRequest),
     Watch(WatchRequest),
     Unwatch(WatchRequest),
 }
@@ -88,14 +99,20 @@ pub struct DiscordBot {
     http: reqwest::Client,
     app_id: String,
     token: String,
+    owner_user_id: Option<String>,
 }
 
 impl DiscordBot {
     pub fn new(app_id: String, token: String) -> Self {
+        Self::with_owner_user(app_id, token, None)
+    }
+
+    pub fn with_owner_user(app_id: String, token: String, owner_user_id: Option<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
             app_id,
             token,
+            owner_user_id,
         }
     }
 
@@ -322,11 +339,17 @@ impl DiscordBot {
                         if !matches!(
                             name.as_str(),
                             "scrape"
+                                | "summarize"
                                 | "watch"
                                 | "unwatch"
                                 | "Add action item"
                                 | "Add action item with note"
                         ) {
+                            return Ok(());
+                        }
+
+                        if !self.interaction_is_from_owner(&interaction) {
+                            self.reject_non_owner_interaction(&interaction).await;
                             return Ok(());
                         }
 
@@ -421,6 +444,25 @@ impl DiscordBot {
                                     reply,
                                 })
                             }
+                            "summarize" => {
+                                let limit = interaction
+                                    .data
+                                    .options
+                                    .iter()
+                                    .find(|opt| opt.name == "limit")
+                                    .and_then(|opt| opt.value.as_i64())
+                                    .unwrap_or(100)
+                                    .clamp(1, 1000)
+                                    as usize;
+                                DiscordCommand::Summarize(SummaryRequest {
+                                    channel_id,
+                                    channel_name,
+                                    guild_name,
+                                    triggered_by: user,
+                                    limit,
+                                    reply,
+                                })
+                            }
                             "Add action item" => {
                                 if interaction.data.kind != Some(3) {
                                     return Ok(());
@@ -488,6 +530,11 @@ impl DiscordBot {
                         else {
                             return Ok(());
                         };
+
+                        if !self.interaction_is_from_owner(&interaction) {
+                            self.reject_non_owner_interaction(&interaction).await;
+                            return Ok(());
+                        }
 
                         if let Err(e) = self.defer_reply(&interaction).await {
                             tracing::warn!("failed to defer Discord modal reply: {e}");
@@ -639,6 +686,27 @@ impl DiscordBot {
         expect_success(response).await
     }
 
+    fn interaction_is_from_owner(&self, interaction: &InteractionCreate) -> bool {
+        let Some(owner_user_id) = self.owner_user_id.as_deref() else {
+            return false;
+        };
+        interaction_user_id(interaction) == Some(owner_user_id)
+    }
+
+    async fn reject_non_owner_interaction(&self, interaction: &InteractionCreate) {
+        let invoker = interaction_user_tag(interaction);
+        tracing::warn!("rejecting Crumb command from non-owner Discord user {invoker}");
+        if let Err(e) = self
+            .send_initial_ephemeral_reply(
+                interaction,
+                "This local Crumb instance only accepts commands from its configured Discord user.",
+            )
+            .await
+        {
+            tracing::warn!("failed to send non-owner Discord command rejection: {e}");
+        }
+    }
+
     async fn fetch_channel_name(
         &self,
         channel_id: &str,
@@ -674,33 +742,50 @@ fn application_command_definitions() -> Value {
                     "required": false
                 }
             ],
-            "integration_types": [1, 0],
+            "integration_types": [1],
             "contexts": [0, 1, 2]
         },
         {
             "type": 3,
             "name": "Add action item",
-            "integration_types": [1, 0],
+            "integration_types": [1],
             "contexts": [0, 1, 2]
         },
         {
             "type": 3,
             "name": "Add action item with note",
-            "integration_types": [1, 0],
+            "integration_types": [1],
+            "contexts": [0, 1, 2]
+        },
+        {
+            "type": 1,
+            "name": "summarize",
+            "description": "Summarize recent messages into a compact conclusion + action list.",
+            "options": [
+                {
+                    "type": 4,
+                    "name": "limit",
+                    "description": "How many recent messages to summarize (1-1000)",
+                    "min_value": 1,
+                    "max_value": 1000,
+                    "required": true
+                }
+            ],
+            "integration_types": [1],
             "contexts": [0, 1, 2]
         },
         {
             "type": 1,
             "name": "watch",
             "description": "Watch this channel for new action items every few minutes.",
-            "integration_types": [1, 0],
+            "integration_types": [1],
             "contexts": [0, 1, 2]
         },
         {
             "type": 1,
             "name": "unwatch",
             "description": "Stop watching this channel for new action items.",
-            "integration_types": [1, 0],
+            "integration_types": [1],
             "contexts": [0, 1, 2]
         }
     ])
@@ -780,6 +865,14 @@ fn interaction_user_tag(interaction: &InteractionCreate) -> String {
         .or_else(|| interaction.member.as_ref().map(|m| &m.user))
         .map(format_user_tag)
         .unwrap_or_else(|| "unknown".into())
+}
+
+fn interaction_user_id(interaction: &InteractionCreate) -> Option<&str> {
+    interaction
+        .user
+        .as_ref()
+        .or_else(|| interaction.member.as_ref().map(|m| &m.user))
+        .map(|user| user.id.as_str())
 }
 
 fn modal_text_value(components: &[InteractionComponent], custom_id: &str) -> Option<String> {
@@ -1466,11 +1559,33 @@ mod tests {
                 "type": 1,
                 "name": "old-command",
                 "description": "A command that should be removed.",
-                "integration_types": [1, 0],
+                "integration_types": [1],
                 "contexts": [0, 1, 2]
             }));
 
         assert!(!application_commands_match(&existing, &desired));
+    }
+
+    #[test]
+    fn owner_check_allows_only_configured_discord_user() {
+        let bot = DiscordBot::with_owner_user("app".into(), "token".into(), Some("user-1".into()));
+
+        assert!(bot.interaction_is_from_owner(&interaction_for_user("user-1")));
+        assert!(!bot.interaction_is_from_owner(&interaction_for_user("user-2")));
+        assert!(!DiscordBot::new("app".into(), "token".into())
+            .interaction_is_from_owner(&interaction_for_user("user-1")));
+    }
+
+    #[test]
+    fn owner_check_reads_guild_member_user() {
+        let bot = DiscordBot::with_owner_user("app".into(), "token".into(), Some("user-1".into()));
+        let mut interaction = interaction_for_user("ignored");
+        interaction.user = None;
+        interaction.member = Some(InteractionMember {
+            user: api_user("user-1"),
+        });
+
+        assert!(bot.interaction_is_from_owner(&interaction));
     }
 
     #[test]
@@ -1490,5 +1605,37 @@ mod tests {
                 "BugBot | https://github.com/apps/bugbot | Review submitted | https://github.com/example/repo/pull/456"
             )
         );
+    }
+
+    fn interaction_for_user(user_id: &str) -> InteractionCreate {
+        InteractionCreate {
+            id: "interaction-1".into(),
+            token: "token".into(),
+            kind: 2,
+            data: InteractionData {
+                kind: Some(1),
+                name: Some("scrape".into()),
+                custom_id: None,
+                options: Vec::new(),
+                target_id: None,
+                resolved: None,
+                components: Vec::new(),
+            },
+            channel_id: "channel-1".into(),
+            channel: None,
+            guild_id: None,
+            guild: None,
+            member: None,
+            user: Some(api_user(user_id)),
+        }
+    }
+
+    fn api_user(id: &str) -> ApiUser {
+        ApiUser {
+            id: id.into(),
+            username: format!("user-{id}"),
+            discriminator: None,
+            global_name: None,
+        }
     }
 }

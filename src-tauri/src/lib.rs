@@ -89,6 +89,10 @@ impl TrayUnreadState {
         inner.known_open_action_ids = open_action_ids;
         inner.has_unread_actions
     }
+
+    fn has_unread_actions(&self) -> bool {
+        self.inner.lock().has_unread_actions
+    }
 }
 
 const POPOVER_WIDTH: f64 = 380.0;
@@ -113,6 +117,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             commands::list_scrapes,
             commands::get_scrape,
@@ -367,10 +372,30 @@ fn action_ids(actions: &[events::CanonicalActionItem]) -> HashSet<String> {
 }
 
 fn set_tray_unread_indicator(app: &AppHandle, has_unread: bool) {
+    let has_runtime_error = app
+        .try_state::<runtime::RuntimeManager>()
+        .is_some_and(|runtime| matches!(runtime.status(), events::SidecarStatus::Error { .. }));
+    set_tray_indicator(app, has_unread, has_runtime_error);
+}
+
+pub fn set_tray_runtime_status(app: &AppHandle, status: &events::SidecarStatus) {
+    let has_unread = app
+        .try_state::<TrayUnreadState>()
+        .is_some_and(|state| state.has_unread_actions());
+    set_tray_indicator(
+        app,
+        has_unread,
+        matches!(status, events::SidecarStatus::Error { .. }),
+    );
+}
+
+fn set_tray_indicator(app: &AppHandle, has_unread: bool, has_runtime_error: bool) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    let icon = if has_unread {
+    let icon = if has_runtime_error {
+        error_tray_icon_image()
+    } else if has_unread {
         unread_tray_icon_image()
     } else {
         tray_icon_image()
@@ -383,7 +408,9 @@ fn set_tray_unread_indicator(app: &AppHandle, has_unread: bool) {
         }
         Err(e) => tracing::warn!("failed to build tray icon: {e}"),
     }
-    let tooltip = if has_unread {
+    let tooltip = if has_runtime_error {
+        "Crumb - Discord connection error"
+    } else if has_unread {
         "Crumb - new action items"
     } else {
         "Crumb"
@@ -403,6 +430,15 @@ fn unread_tray_icon_image() -> tauri::Result<Image<'static>> {
     let height = base.height();
     let mut rgba = base.rgba().to_vec();
     draw_unread_dot(&mut rgba, width, height);
+    Ok(Image::new_owned(rgba, width, height))
+}
+
+fn error_tray_icon_image() -> tauri::Result<Image<'static>> {
+    let base = tray_icon_image()?;
+    let width = base.width();
+    let height = base.height();
+    let mut rgba = base.rgba().to_vec();
+    draw_error_x(&mut rgba, width, height);
     Ok(Image::new_owned(rgba, width, height))
 }
 
@@ -436,6 +472,35 @@ fn draw_unread_dot(rgba: &mut [u8], width: u32, height: u32) {
             rgba[idx + 1] = 0;
             rgba[idx + 2] = 0;
             rgba[idx + 3] = rgba[idx + 3].max((255.0 * edge).round() as u8);
+        }
+    }
+}
+
+fn draw_error_x(rgba: &mut [u8], width: u32, height: u32) {
+    let scale = (width.min(height) as f32 / 44.0).max(0.5);
+    let center_x = width as f32 - 8.0 * scale;
+    let center_y = 8.0 * scale;
+    let clear_radius = 8.5 * scale;
+
+    for y in 0..height {
+        for x in 0..width {
+            let distance = pixel_distance(x, y, center_x, center_y);
+            let idx = ((y * width + x) * 4) as usize;
+            if distance <= clear_radius {
+                rgba[idx + 3] = 0;
+            }
+            if distance > clear_radius {
+                continue;
+            }
+
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = y as f32 + 0.5 - center_y;
+            if (dx - dy).abs() <= 1.4 * scale || (dx + dy).abs() <= 1.4 * scale {
+                rgba[idx] = 0;
+                rgba[idx + 1] = 0;
+                rgba[idx + 2] = 0;
+                rgba[idx + 3] = 255;
+            }
         }
     }
 }
