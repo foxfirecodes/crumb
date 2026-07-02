@@ -74,7 +74,7 @@ Crumb currently runs as a local developer app. You will need:
 - Node/npm
 - Rust + Cargo
 - Tauri system prerequisites
-- Claude Code installed and logged in
+- Claude Code or Codex installed and logged in
 - A Discord application/bot token
 - Your Discord user token for reading message history
 
@@ -92,9 +92,9 @@ pnpm install
 pnpm run tauri:dev
 ```
 
-3. Open **Settings...** from the tray menu and fill in your Discord application ID, bot token, and user token.
+3. Open **Settings...** from the tray menu and fill in your Discord application ID, bot token, user token, and ACP connector.
 
-Claude auth is reused from your existing Claude Code login. You do not need an Anthropic API key for the default setup.
+Connector auth is reused from the selected local agent login. The Claude Code preset does not need an Anthropic API key for the default setup.
 
 4. Install the Discord app to your account, then try `/scrape` in a DM or channel.
 

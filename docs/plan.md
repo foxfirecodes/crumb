@@ -7,7 +7,7 @@ This is the implementation contract for the current first cut.
 1. A macOS menubar app runs as one Tauri process.
 2. The Rust backend owns the Discord bot gateway connection and registers a user-installable `/scrape` command.
 3. When `/scrape` runs, Rust fetches message history with the operator's Discord user token using Discord's REST API.
-4. The transcript is sent through the Agent Client Protocol Rust SDK to the Claude ACP connector.
+4. The transcript is sent through the Agent Client Protocol Rust SDK to the selected ACP connector.
 5. Results are persisted to SQLite and pushed to the menubar UI over Tauri events.
 
 Out of scope for MVP: Notion, Asana, polling/background sync, push notifications, breadcrumb cross-referencing, multi-user.
@@ -22,7 +22,7 @@ crumb (Tauri app)
    ├─ SQLite persistence
    ├─ Discord bot gateway + slash command registration
    ├─ Discord REST message-history scraper
-   └─ ACP client -> Claude ACP connector
+   └─ ACP client -> selected ACP connector
 ```
 
 There is no Bun sidecar and no JavaScript Discord worker. The frontend event names still use `sidecar:status` for compatibility with the existing UI IPC layer, but the implementation is in-process Rust.
@@ -45,13 +45,19 @@ src-tauri/src/
 
 Crumb stores Discord and AI settings in app data as `settings.json`. Developer builds can import a repo-root `.env` once when no app settings file exists, but bundled app usage is settings-window driven.
 
-AI auth is handled by the Claude Code ACP connector. By default Crumb pins the connector version and spawns:
+AI auth is handled by the selected ACP connector. Crumb currently ships presets for Claude Code, Codex, and custom ACP commands. The Claude Code preset pins the connector version and spawns:
 
 ```bash
-bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'
+npx -y @agentclientprotocol/claude-agent-acp@0.33.1
 ```
 
-The settings window can override the ACP command with any other ACP-compatible agent command. Crumb passes ACP session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. It reuses normal Claude Code auth by default, unless a separate Claude config directory is configured.
+The Codex preset defaults to:
+
+```bash
+npx -y @agentclientprotocol/codex-acp@0.0.44
+```
+
+Crumb wraps configured ACP commands with `bash -ic` at launch time so Finder-launched app bundles can still use shell PATH setup. Custom ACP settings can provide a raw command, environment assignments, and session metadata JSON. Claude Code settings remain connector-specific: Crumb passes Claude Code session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. Codex settings are passed through `CODEX_CONFIG` with the selected model and reasoning effort.
 
 ## /scrape Flow
 

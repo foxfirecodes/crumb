@@ -1214,7 +1214,7 @@ fn pr_label(url: &str) -> String {
 
 fn user_facing_scrape_error(error: &str) -> String {
     if error.contains("Authentication required") {
-        return "Claude Code authentication is required for extraction. Run `claude` in a terminal and complete login, or clear/fix the configured Claude config dir if it points at an unauthenticated config.".into();
+        return "ACP connector authentication is required for extraction. Run the configured agent in a terminal and complete login, or fix the selected connector's config/auth settings.".into();
     }
     error.into()
 }

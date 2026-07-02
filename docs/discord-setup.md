@@ -98,16 +98,20 @@ Open **Settings...** from Crumb's tray menu and enter:
 - Bot token
 - User token
 
-> **No `ANTHROPIC_API_KEY` needed.** Crumb is an ACP client. By default it connects to Claude Code through the pinned command `bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'`, which reuses your existing Claude Code auth.
+> **No `ANTHROPIC_API_KEY` needed for the Claude Code preset.** Crumb is an ACP client. Select Claude Code, Codex, or Custom in settings; Crumb wraps command fields with `bash -ic` at launch time so bundled app launches can use your shell PATH.
 
 Optional AI settings:
 
-- Model: `sonnet` or `haiku`
-- Effort: `low`, `medium`, `high`, or `xhigh`
+- Connector: Claude Code, Codex, or Custom
+- Claude Code model: `sonnet` or `haiku`
+- Claude Code effort: `low`, `medium`, `high`, or `xhigh`
+- Codex model: `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
+- Codex effort: `low`, `medium`, `high`, or `xhigh`
+- Codex ACP command: defaults to `npx -y @agentclientprotocol/codex-acp@0.0.44`
 - Claude config dir: optional path to a separate Claude config/auth directory
-- ACP command: optional alternate ACP-compatible agent command
+- ACP command: optional alternate ACP-compatible agent command for the selected connector
 
-Crumb passes Claude Code session options and environment variables to use the configured model/effort and disable project/user setting sources, hooks, tools, prompt history, and memory for extraction sessions. By default it does not override `CLAUDE_CONFIG_DIR`, so the ACP connector can reuse your normal Claude Code auth. If you set a Claude config dir, that directory must already be logged into Claude Code.
+Crumb passes Claude Code session options and environment variables only when the Claude Code preset is selected. By default it does not override `CLAUDE_CONFIG_DIR`, so the ACP connector can reuse your normal Claude Code auth. If you set a Claude config dir, that directory must already be logged into Claude Code.
 
 For developer builds, Crumb can import a repo-root `.env` once if no app settings file exists. Normal bundled use does not require `.env`.
 

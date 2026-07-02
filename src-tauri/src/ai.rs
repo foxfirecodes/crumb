@@ -10,16 +10,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::discord::{NormalizedMessage, NormalizedPerson};
 use crate::events::{CanonicalActionItem, Decision};
-use crate::settings::{AppSettings, SettingsTestResult};
+use crate::settings::{AcpConnector, AppSettings, SettingsTestResult};
 
-const DEFAULT_ACP_AGENT_COMMAND: &str =
-    "bash -ic 'npx -y @agentclientprotocol/claude-agent-acp@0.33.1'";
+const DEFAULT_CLAUDE_CODE_ACP_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.33.1";
+const DEFAULT_CODEX_ACP_COMMAND: &str = "npx -y @agentclientprotocol/codex-acp@0.0.44";
+const ACP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SYSTEM_PROMPT: &str = r#"You are an extraction and reconciliation specialist. You receive a chronological transcript of Discord messages from a single source plus existing records Crumb already knows about from that source. Your job is to identify:
 
@@ -173,8 +174,9 @@ pub async fn extract(
         settings,
     )
     .await?;
+    let connector = settings.acp_connector.label();
     let json = extract_json_object(&response).with_context(|| {
-        format!("Claude ACP response did not contain a JSON object: {response}")
+        format!("{connector} ACP response did not contain a JSON object: {response}")
     })?;
     let parsed: Extraction = serde_json::from_str(json).context("extraction schema mismatch")?;
 
@@ -215,8 +217,9 @@ pub async fn extract_targeted_action(
         settings,
     )
     .await?;
+    let connector = settings.acp_connector.label();
     let json = extract_json_object(&response).with_context(|| {
-        format!("Claude ACP response did not contain a JSON object: {response}")
+        format!("{connector} ACP response did not contain a JSON object: {response}")
     })?;
     let parsed: Extraction = serde_json::from_str(json).context("extraction schema mismatch")?;
 
@@ -271,8 +274,9 @@ pub async fn extract_noted_action(
             settings,
         )
         .await?;
+        let connector = settings.acp_connector.label();
         let json = extract_json_object(&response).with_context(|| {
-            format!("Claude ACP response did not contain a JSON object: {response}")
+            format!("{connector} ACP response did not contain a JSON object: {response}")
         })?;
         serde_json::from_str::<Extraction>(json).context("extraction schema mismatch")
     }
@@ -332,7 +336,7 @@ async fn run_acp_prompt(
 ) -> Result<String> {
     let output = Arc::new(Mutex::new(String::new()));
     let output_for_handler = output.clone();
-    let session_meta = acp_session_meta(settings);
+    let session_meta = acp_session_meta(settings)?;
 
     acp::Client
         .builder()
@@ -388,7 +392,10 @@ async fn run_acp_prompt(
 
     let text = output.lock().trim().to_string();
     if text.is_empty() {
-        Err(anyhow!("Claude ACP connector returned no text"))
+        Err(anyhow!(
+            "{} ACP connector returned no text",
+            settings.acp_connector.label()
+        ))
     } else {
         Ok(text)
     }
@@ -398,59 +405,140 @@ fn agent_workspace() -> PathBuf {
     std::env::temp_dir()
 }
 
-pub fn test_settings(settings: &AppSettings) -> SettingsTestResult {
+pub async fn test_settings(settings: &AppSettings) -> SettingsTestResult {
     let settings = settings.clone().normalized();
-    if settings
-        .acp_agent_command()
-        .is_some_and(|command| command.trim_start().starts_with('{'))
-    {
-        return SettingsTestResult::ok("Custom ACP JSON is configured.");
+    if settings.acp_connector == AcpConnector::Custom {
+        if let Err(e) = parse_custom_session_meta(&settings) {
+            return SettingsTestResult::error(e.to_string());
+        }
     }
 
-    let command = settings
-        .acp_agent_command()
-        .unwrap_or_else(|| DEFAULT_ACP_AGENT_COMMAND.to_string());
-    let Some(executable) = first_executable(&command) else {
-        return SettingsTestResult::error("AI command is empty.");
+    if selected_acp_command(&settings).is_none() {
+        return SettingsTestResult::error(missing_acp_command_message(&settings));
     };
 
-    match Command::new(&executable).arg("--version").output() {
-        Ok(output) if output.status.success() => SettingsTestResult::ok(format!(
-            "Found `{executable}`. Claude extraction command is locally launchable."
+    match tokio::time::timeout(ACP_TEST_TIMEOUT, test_acp_session(settings.clone())).await {
+        Ok(Ok(())) => SettingsTestResult::ok(format!(
+            "{} ACP connector initialized and opened a session.",
+            settings.acp_connector.label()
         )),
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let detail = if stderr.is_empty() {
-                format!("`{executable} --version` exited with {}", output.status)
-            } else {
-                stderr
-            };
-            SettingsTestResult::error(format!("Could not validate `{executable}`: {detail}"))
-        }
-        Err(e) => SettingsTestResult::error(format!(
-            "Could not launch `{executable}`. If Crumb is launched from Finder, configure an explicit ACP command path. {e}"
+        Ok(Err(e)) => SettingsTestResult::error(format!(
+            "{} ACP connector failed to initialize: {e}",
+            settings.acp_connector.label()
+        )),
+        Err(_) => SettingsTestResult::error(format!(
+            "{} ACP connector did not initialize within {} seconds.",
+            settings.acp_connector.label(),
+            ACP_TEST_TIMEOUT.as_secs()
         )),
     }
 }
 
+async fn test_acp_session(settings: AppSettings) -> Result<()> {
+    let agent = build_acp_agent(&settings)?;
+    let session_meta = acp_session_meta(&settings)?;
+
+    acp::Client
+        .builder()
+        .on_receive_request(
+            async move |_request: RequestPermissionRequest, responder, _connection| {
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            },
+            acp::on_receive_request!(),
+        )
+        .connect_with(agent, move |connection: acp::ConnectionTo<acp::Agent>| {
+            let session_meta = session_meta.clone();
+            async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1).client_info(
+                        Implementation::new("crumb", env!("CARGO_PKG_VERSION")).title("Crumb"),
+                    ))
+                    .block_task()
+                    .await?;
+
+                connection
+                    .send_request(NewSessionRequest::new(agent_workspace()).meta(session_meta))
+                    .block_task()
+                    .await?;
+
+                Ok(())
+            }
+        })
+        .await?;
+
+    Ok(())
+}
+
 fn build_acp_agent(settings: &AppSettings) -> Result<acp::AcpAgent> {
-    let command = settings
-        .acp_agent_command()
-        .unwrap_or_else(|| DEFAULT_ACP_AGENT_COMMAND.to_string());
+    let command = selected_acp_command(settings)
+        .ok_or_else(|| anyhow!(missing_acp_command_message(settings)))?;
     if command.trim_start().starts_with('{') {
         return acp::AcpAgent::from_str(&command)
             .with_context(|| format!("parsing ACP command: {command}"));
     }
 
-    let command = format!("{} {command}", acp_agent_env_prefix(settings))
-        .trim()
-        .to_string();
+    let env_prefix = acp_agent_env_prefix(settings);
+    let command = if env_prefix.is_empty() {
+        command
+    } else {
+        format!("{env_prefix} {command}")
+    };
+    let command = format!("bash -ic {}", shell_quote(&command));
     acp::AcpAgent::from_str(&command).with_context(|| format!("parsing ACP command: {command}"))
 }
 
+fn missing_acp_command_message(settings: &AppSettings) -> &'static str {
+    match settings.acp_connector {
+        AcpConnector::ClaudeCode => "Claude Code ACP command is empty.",
+        AcpConnector::Codex => "Codex ACP command is empty.",
+        AcpConnector::Custom => "Custom ACP command is empty.",
+    }
+}
+
+fn selected_acp_command(settings: &AppSettings) -> Option<String> {
+    match settings.acp_connector {
+        AcpConnector::ClaudeCode => Some(
+            settings
+                .claude_code
+                .command()
+                .unwrap_or_else(|| DEFAULT_CLAUDE_CODE_ACP_COMMAND.to_string()),
+        ),
+        AcpConnector::Codex => settings
+            .codex
+            .command()
+            .or_else(|| Some(DEFAULT_CODEX_ACP_COMMAND.to_string()))
+            .map(|command| expand_codex_command_placeholders(&command, settings)),
+        AcpConnector::Custom => settings.custom_acp.command(),
+    }
+}
+
+fn expand_codex_command_placeholders(command: &str, settings: &AppSettings) -> String {
+    command
+        .replace("{model}", &settings.codex.model)
+        .replace("{effort}", &settings.codex.effort)
+}
+
 fn acp_agent_env_args(settings: &AppSettings) -> Vec<String> {
-    let model = crumb_ai_model(settings);
-    let effort = crumb_ai_effort(settings);
+    match settings.acp_connector {
+        AcpConnector::ClaudeCode => claude_code_env_args(settings),
+        AcpConnector::Codex => codex_env_args(settings),
+        AcpConnector::Custom => custom_env_args(settings),
+    }
+}
+
+fn codex_env_args(settings: &AppSettings) -> Vec<String> {
+    let config = json!({
+        "model": settings.codex.model.clone(),
+        "model_reasoning_effort": settings.codex.effort.clone(),
+    });
+    vec![format!("CODEX_CONFIG={config}")]
+}
+
+fn claude_code_env_args(settings: &AppSettings) -> Vec<String> {
+    let model = claude_code_model(settings);
+    let effort = claude_code_effort(settings);
     let mut env = vec![
         format!("ANTHROPIC_MODEL={model}"),
         format!("CLAUDE_CODE_EFFORT_LEVEL={effort}"),
@@ -464,18 +552,53 @@ fn acp_agent_env_args(settings: &AppSettings) -> Vec<String> {
         "DISABLE_TELEMETRY=1".into(),
         "MAX_THINKING_TOKENS=0".into(),
     ];
-    if let Some(config_dir) = settings.claude_config_dir() {
+    if let Some(config_dir) = settings.claude_code.config_dir() {
         env.push(format!("CLAUDE_CONFIG_DIR={config_dir}"));
     }
     env
 }
 
+fn custom_env_args(settings: &AppSettings) -> Vec<String> {
+    settings
+        .custom_acp
+        .env()
+        .into_iter()
+        .flat_map(|env| {
+            env.lines()
+                .filter_map(|line| {
+                    let Some((key, _)) = line.split_once('=') else {
+                        tracing::warn!("ignoring custom ACP env line without '=': {line}");
+                        return None;
+                    };
+                    if looks_like_env_key(key) {
+                        Some(line.to_string())
+                    } else {
+                        tracing::warn!("ignoring custom ACP env line with invalid key: {line}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn acp_agent_env_prefix(settings: &AppSettings) -> String {
     acp_agent_env_args(settings)
         .into_iter()
-        .map(|assignment| shell_quote(&assignment))
+        .map(|assignment| shell_quote_env_assignment(&assignment))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn shell_quote_env_assignment(assignment: &str) -> String {
+    let Some((key, value)) = assignment.split_once('=') else {
+        return shell_quote(assignment);
+    };
+    if looks_like_env_key(key) {
+        format!("{key}={}", shell_quote(value))
+    } else {
+        shell_quote(assignment)
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -584,9 +707,37 @@ fn build_noted_action_prompt(
     ))
 }
 
-fn acp_session_meta(settings: &AppSettings) -> Map<String, Value> {
-    let model = crumb_ai_model(settings);
-    let effort = crumb_ai_effort(settings);
+fn acp_session_meta(settings: &AppSettings) -> Result<Map<String, Value>> {
+    match settings.acp_connector {
+        AcpConnector::ClaudeCode => Ok(claude_code_session_meta(settings)),
+        AcpConnector::Codex => Ok(generic_session_meta()),
+        AcpConnector::Custom => parse_custom_session_meta(settings),
+    }
+}
+
+fn generic_session_meta() -> Map<String, Value> {
+    json_object_map(json!({
+        "disableBuiltInTools": true
+    }))
+}
+
+fn parse_custom_session_meta(settings: &AppSettings) -> Result<Map<String, Value>> {
+    let Some(session_meta) = settings.custom_acp.session_meta() else {
+        return Ok(generic_session_meta());
+    };
+    let value: Value = serde_json::from_str(&session_meta)
+        .context("Custom ACP session metadata must be valid JSON")?;
+    match value {
+        Value::Object(map) => Ok(map),
+        _ => Err(anyhow!(
+            "Custom ACP session metadata must be a JSON object at the top level."
+        )),
+    }
+}
+
+fn claude_code_session_meta(settings: &AppSettings) -> Map<String, Value> {
+    let model = claude_code_model(settings);
+    let effort = claude_code_effort(settings);
     let mut env = Map::new();
     env.insert("ANTHROPIC_MODEL".into(), Value::String(model.clone()));
     env.insert(
@@ -623,11 +774,11 @@ fn acp_session_meta(settings: &AppSettings) -> Map<String, Value> {
     );
     env.insert("DISABLE_TELEMETRY".into(), Value::String("1".into()));
     env.insert("MAX_THINKING_TOKENS".into(), Value::String("0".into()));
-    if let Some(config_dir) = settings.claude_config_dir() {
+    if let Some(config_dir) = settings.claude_code.config_dir() {
         env.insert("CLAUDE_CONFIG_DIR".into(), Value::String(config_dir));
     }
 
-    let meta = json!({
+    json_object_map(json!({
         "disableBuiltInTools": true,
         "claudeCode": {
             "options": {
@@ -656,16 +807,18 @@ fn acp_session_meta(settings: &AppSettings) -> Map<String, Value> {
                 "env": env
             }
         }
-    });
+    }))
+}
 
-    match meta {
+fn json_object_map(value: Value) -> Map<String, Value> {
+    match value {
         Value::Object(map) => map,
         _ => Map::new(),
     }
 }
 
-fn crumb_ai_model(settings: &AppSettings) -> String {
-    let requested = settings.ai_model.trim();
+fn claude_code_model(settings: &AppSettings) -> String {
+    let requested = settings.claude_code.model.trim();
     let normalized = requested.trim().to_lowercase();
     if normalized.contains("sonnet") || normalized.contains("haiku") {
         requested.to_string()
@@ -675,8 +828,8 @@ fn crumb_ai_model(settings: &AppSettings) -> String {
     }
 }
 
-fn crumb_ai_effort(settings: &AppSettings) -> String {
-    let requested = settings.ai_effort.trim();
+fn claude_code_effort(settings: &AppSettings) -> String {
+    let requested = settings.claude_code.effort.trim();
     let normalized = requested.trim().to_lowercase();
     if matches!(normalized.as_str(), "low" | "medium" | "high" | "xhigh") {
         normalized
@@ -686,18 +839,7 @@ fn crumb_ai_effort(settings: &AppSettings) -> String {
     }
 }
 
-fn first_executable(command: &str) -> Option<String> {
-    command
-        .split_whitespace()
-        .map(|part| part.trim_matches('"').trim_matches('\''))
-        .find(|part| !part.is_empty() && !looks_like_env_assignment(part))
-        .map(ToOwned::to_owned)
-}
-
-fn looks_like_env_assignment(part: &str) -> bool {
-    let Some((key, _)) = part.split_once('=') else {
-        return false;
-    };
+fn looks_like_env_key(key: &str) -> bool {
     !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -1045,6 +1187,52 @@ mod tests {
             action.dedupe_key.as_deref(),
             Some("noted-action-123-follow-up-with-ada")
         );
+    }
+
+    #[test]
+    fn codex_connector_defaults_to_pinned_acp_package() {
+        let settings = AppSettings {
+            acp_connector: AcpConnector::Codex,
+            ..AppSettings::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            selected_acp_command(&settings).as_deref(),
+            Some("npx -y @agentclientprotocol/codex-acp@0.0.44")
+        );
+        assert!(acp_agent_env_prefix(&settings).contains(
+            "CODEX_CONFIG='{\"model\":\"gpt-5.4-mini\",\"model_reasoning_effort\":\"low\"}'"
+        ));
+    }
+
+    #[test]
+    fn codex_adapter_command_expands_model_and_effort() {
+        let mut settings = AppSettings {
+            acp_connector: AcpConnector::Codex,
+            ..AppSettings::default()
+        };
+        settings.codex.command = "codex-acp-adapter --model {model} --effort {effort}".into();
+        let settings = settings.normalized();
+
+        assert_eq!(
+            selected_acp_command(&settings).as_deref(),
+            Some("codex-acp-adapter --model gpt-5.4-mini --effort low")
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_test_rejects_command_that_does_not_speak_acp() {
+        let mut settings = AppSettings {
+            acp_connector: AcpConnector::Custom,
+            ..AppSettings::default()
+        };
+        settings.custom_acp.command = "bash -ic 'printf not-acp'".into();
+        let settings = settings.normalized();
+
+        let result = test_settings(&settings).await;
+
+        assert!(!result.ok);
     }
 
     fn message(id: &str, content: &str) -> NormalizedMessage {
