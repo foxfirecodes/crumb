@@ -61,6 +61,16 @@ pub struct ScrapeRequest {
 }
 
 #[derive(Debug)]
+pub struct SummaryRequest {
+    pub channel_id: String,
+    pub channel_name: Option<String>,
+    pub guild_name: Option<String>,
+    pub triggered_by: String,
+    pub limit: usize,
+    pub reply: InteractionReply,
+}
+
+#[derive(Debug)]
 pub struct WatchRequest {
     pub interaction_id: String,
     pub channel_id: String,
@@ -74,6 +84,7 @@ pub struct WatchRequest {
 #[derive(Debug)]
 pub enum DiscordCommand {
     Scrape(ScrapeRequest),
+    Summarize(SummaryRequest),
     Watch(WatchRequest),
     Unwatch(WatchRequest),
 }
@@ -322,6 +333,7 @@ impl DiscordBot {
                         if !matches!(
                             name.as_str(),
                             "scrape"
+                                | "summarize"
                                 | "watch"
                                 | "unwatch"
                                 | "Add action item"
@@ -418,6 +430,25 @@ impl DiscordBot {
                                     target_message_id: None,
                                     target_message: None,
                                     action_note: None,
+                                    reply,
+                                })
+                            }
+                            "summarize" => {
+                                let limit = interaction
+                                    .data
+                                    .options
+                                    .iter()
+                                    .find(|opt| opt.name == "limit")
+                                    .and_then(|opt| opt.value.as_i64())
+                                    .unwrap_or(100)
+                                    .clamp(1, 1000)
+                                    as usize;
+                                DiscordCommand::Summarize(SummaryRequest {
+                                    channel_id,
+                                    channel_name,
+                                    guild_name,
+                                    triggered_by: user,
+                                    limit,
                                     reply,
                                 })
                             }
@@ -686,6 +717,23 @@ fn application_command_definitions() -> Value {
         {
             "type": 3,
             "name": "Add action item with note",
+            "integration_types": [1, 0],
+            "contexts": [0, 1, 2]
+        },
+        {
+            "type": 1,
+            "name": "summarize",
+            "description": "Summarize recent messages into a compact conclusion + action list.",
+            "options": [
+                {
+                    "type": 4,
+                    "name": "limit",
+                    "description": "How many recent messages to summarize (1-1000)",
+                    "min_value": 1,
+                    "max_value": 1000,
+                    "required": true
+                }
+            ],
             "integration_types": [1, 0],
             "contexts": [0, 1, 2]
         },

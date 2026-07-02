@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::async_runtime;
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
@@ -14,7 +15,7 @@ use crate::ai;
 use crate::db::{ActionCandidate, Db, DecisionCandidate, WatchedChannel};
 use crate::discord::{
     DiscordBot, DiscordCommand, DiscordScraper, NormalizedMessage, NormalizedPerson, ScrapeRequest,
-    WatchRequest,
+    SummaryRequest, WatchRequest,
 };
 use crate::events::{CanonicalActionItem, ScrapeSummary, SidecarStatus};
 use crate::settings::AppSettings;
@@ -192,6 +193,7 @@ async fn run(
 
 enum WorkItem {
     Scrape(ScrapeRequest),
+    Summarize(SummaryRequest),
     Watch(WatchRequest),
     Unwatch(WatchRequest),
     Poll(WatchedChannel),
@@ -214,6 +216,7 @@ async fn command_queue_loop(
                 };
                 let item = match command {
                     DiscordCommand::Scrape(req) => WorkItem::Scrape(req),
+                    DiscordCommand::Summarize(req) => WorkItem::Summarize(req),
                     DiscordCommand::Watch(req) => WorkItem::Watch(req),
                     DiscordCommand::Unwatch(req) => WorkItem::Unwatch(req),
                 };
@@ -284,6 +287,7 @@ async fn work_loop(
                 };
                 match item {
                     WorkItem::Scrape(req) => do_scrape(app.clone(), db.clone(), scraper.clone(), settings.clone(), req).await,
+                    WorkItem::Summarize(req) => do_summarize(app.clone(), scraper.clone(), settings.clone(), req).await,
                     WorkItem::Watch(req) => do_watch(db.clone(), scraper.clone(), req).await,
                     WorkItem::Unwatch(req) => do_unwatch(db.clone(), req).await,
                     WorkItem::Poll(channel) => do_watch_poll(app.clone(), db.clone(), scraper.clone(), settings.clone(), channel).await,
@@ -411,6 +415,80 @@ async fn do_scrape(
             tracing::error!("scrape failed: {msg}");
             emit_failed(&app, &db, &req.scrape_id, &user_msg);
             let _ = req.reply.send(format!("Scrape failed: {user_msg}")).await;
+        }
+    }
+}
+
+async fn do_summarize(
+    app: AppHandle,
+    scraper: Option<DiscordScraper>,
+    settings: AppSettings,
+    req: SummaryRequest,
+) {
+    let Some(scraper) = scraper else {
+        let msg = "Summarizer is offline. The Discord user token is missing or rejected. Re-extract it from the Discord web app and restart Crumb.";
+        let _ = req.reply.send(msg).await;
+        return;
+    };
+    let current_user = scraper.self_user();
+    let label = channel_label(
+        req.guild_name.as_deref(),
+        req.channel_name.as_deref(),
+        &req.channel_id,
+    );
+    tracing::info!(
+        "summarizing {} messages from {} for {}",
+        req.limit,
+        label,
+        req.triggered_by
+    );
+
+    let result = async {
+        let messages = scraper
+            .fetch_channel_messages(&req.channel_id, req.limit, |_| {})
+            .await
+            .context("fetching messages for summary")?;
+
+        let _ = req
+            .reply
+            .send(format!(
+                "Summarizing {} message{}...",
+                messages.len(),
+                if messages.len() == 1 { "" } else { "s" }
+            ))
+            .await;
+
+        let markdown = ai::summarize(&messages, Some(&current_user), &settings)
+            .await
+            .context("summarization failed")?;
+        let clipboard_result = app
+            .clipboard()
+            .write_text(markdown.clone())
+            .map_err(|e| e.to_string());
+
+        Ok::<_, anyhow::Error>((markdown, clipboard_result))
+    }
+    .await;
+
+    match result {
+        Ok((markdown, Ok(()))) => {
+            let _ = req.reply.send(summary_reply_content(&markdown, None)).await;
+        }
+        Ok((markdown, Err(e))) => {
+            tracing::warn!("failed to copy summary to clipboard: {e}");
+            let _ = req
+                .reply
+                .send(summary_reply_content(&markdown, Some(&e)))
+                .await;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let user_msg = user_facing_scrape_error(&msg);
+            tracing::error!("summarize failed: {msg}");
+            let _ = req
+                .reply
+                .send(format!("Summarize failed: {user_msg}"))
+                .await;
         }
     }
 }
@@ -762,6 +840,16 @@ fn channel_label(guild_name: Option<&str>, channel_name: Option<&str>, channel_i
         (Some(guild), None) => format!("{guild} / {channel_id}"),
         (None, None) => channel_id.to_string(),
     }
+}
+
+fn summary_reply_content(markdown: &str, clipboard_error: Option<&str>) -> String {
+    let escaped = markdown.replace("```", "'''");
+    let status = if clipboard_error.is_some() {
+        "Summary generated, but clipboard copy failed."
+    } else {
+        "Copied to clipboard."
+    };
+    format!("{status}\n```md\n{escaped}\n```")
 }
 
 fn source_label_from_summary(summary: &ScrapeSummary) -> String {
@@ -1686,6 +1774,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["101"]
         );
+    }
+
+    #[test]
+    fn summary_reply_wraps_markdown_and_escapes_nested_fences() {
+        let reply = summary_reply_content("Conclusion\n```oops```\n\nAction items\nNone.", None);
+
+        assert!(reply.starts_with("Copied to clipboard.\n```md\nConclusion"));
+        assert!(reply.ends_with("\n```"));
+        assert!(reply.contains("'''oops'''"));
     }
 
     fn message(id: &str, content: &str) -> NormalizedMessage {
