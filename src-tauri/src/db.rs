@@ -215,7 +215,12 @@ impl Db {
         self.list_action_items("open")
     }
 
-    pub fn create_manual_action(&self, title: &str) -> Result<CanonicalActionItem> {
+    pub fn create_manual_action(
+        &self,
+        title: &str,
+        assignee_key: Option<&str>,
+        assignee: Option<&str>,
+    ) -> Result<CanonicalActionItem> {
         let title = title.trim();
         if title.is_empty() {
             bail!("manual action item title is required");
@@ -223,6 +228,8 @@ impl Db {
         if title.chars().count() > 500 {
             bail!("manual action item title must be 500 characters or fewer");
         }
+        let assignee = assignee.map(str::trim).filter(|value| !value.is_empty());
+        let assignee_key = stable_assignee_key(assignee_key, assignee);
 
         let id = uuid::Uuid::new_v4().to_string();
         let evidence_id = uuid::Uuid::new_v4().to_string();
@@ -237,10 +244,20 @@ impl Db {
         tx.execute(
             "INSERT INTO canonical_action_items (
                id, title, status, source_kind, source_scope, source_label, dedupe_key,
-               priority, relevance_score, first_seen_at, last_seen_at
+               assignee_key, assignee, priority, relevance_score, first_seen_at, last_seen_at
              )
-             VALUES (?, ?, 'inbox', 'manual', ?, ?, ?, 0, 0, ?, ?)",
-            rusqlite::params![id, title, source_scope, source_label, dedupe_key, now, now],
+             VALUES (?, ?, 'inbox', 'manual', ?, ?, ?, ?, ?, 0, 0, ?, ?)",
+            rusqlite::params![
+                id,
+                title,
+                source_scope,
+                source_label,
+                dedupe_key,
+                assignee_key.as_deref(),
+                assignee,
+                now,
+                now
+            ],
         )?;
         tx.execute(
             "INSERT INTO action_item_evidence (
@@ -2157,7 +2174,7 @@ mod tests {
             std::env::temp_dir().join(format!("crumb-manual-action-{}.db", uuid::Uuid::new_v4()));
         let db = Db::open(&db_path)?;
 
-        let created = db.create_manual_action("  Write launch notes  ")?;
+        let created = db.create_manual_action("  Write launch notes  ", None, None)?;
         assert_eq!(created.title, "Write launch notes");
         assert_eq!(created.status, "inbox");
         assert_eq!(created.source_kind, "manual");
@@ -2168,7 +2185,30 @@ mod tests {
         let actions = db.list_open_action_items()?;
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].id, created.id);
-        assert!(db.create_manual_action("   ").is_err());
+        assert!(db.create_manual_action("   ", None, None).is_err());
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_actions_can_be_created_with_assignee() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-manual-action-assignee-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::open(&db_path)?;
+
+        let created =
+            db.create_manual_action("Send API notes", Some("discord:user:fox"), Some(" fox "))?;
+
+        assert_eq!(created.assignee.as_deref(), Some("fox"));
+        assert_eq!(created.assignee_key.as_deref(), Some("discord:user:fox"));
+
+        let actions = db.list_open_action_items()?;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].assignee.as_deref(), Some("fox"));
+        assert_eq!(actions[0].assignee_key.as_deref(), Some("discord:user:fox"));
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
@@ -2182,8 +2222,8 @@ mod tests {
         ));
         {
             let db = Db::open(&db_path)?;
-            db.create_manual_action("Write launch notes")?;
-            db.create_manual_action("Write launch notes for app")?;
+            db.create_manual_action("Write launch notes", None, None)?;
+            db.create_manual_action("Write launch notes for app", None, None)?;
             assert_eq!(db.list_open_action_items()?.len(), 2);
         }
 
