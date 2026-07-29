@@ -48,16 +48,16 @@ Crumb stores Discord and AI settings in app data as `settings.json`. Developer b
 AI auth is handled by the selected ACP connector. Crumb currently ships presets for Claude Code, Codex, and custom ACP commands. The Claude Code preset pins the connector version and spawns:
 
 ```bash
-npx -y @agentclientprotocol/claude-agent-acp@0.33.1
+npx -y @agentclientprotocol/claude-agent-acp@0.62.0
 ```
 
 The Codex preset defaults to:
 
 ```bash
-npx -y @agentclientprotocol/codex-acp@0.0.44
+npx -y @agentclientprotocol/codex-acp@1.1.7
 ```
 
-Crumb wraps configured ACP commands with `bash -ic` at launch time so Finder-launched app bundles can still use shell PATH setup. Custom ACP settings can provide a raw command, environment assignments, and session metadata JSON. Claude Code settings remain connector-specific: Crumb passes Claude Code session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. Codex settings are passed through `CODEX_CONFIG` with the selected model and reasoning effort.
+Crumb wraps configured ACP commands with `bash -ic` at launch time so Finder-launched app bundles can still use shell PATH setup. Custom ACP settings can provide a raw command, environment assignments, and session metadata JSON. Claude Code settings remain connector-specific: Crumb passes Claude Code session options and environment variables that default the model to `sonnet`, default effort to `low`, restrict model selection to the configured Sonnet/Haiku family, disable Claude Code setting sources/hooks/tools for extraction, and skip prompt history. Codex settings are passed through `CODEX_CONFIG` with the selected model and reasoning effort. After each extraction or settings test, Crumb requests `session/delete` when the selected connector advertises that capability; cleanup failures are logged without discarding a successful extraction.
 
 ## /scrape Flow
 

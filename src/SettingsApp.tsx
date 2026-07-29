@@ -11,8 +11,8 @@ import {
 import type { AcpConnector, AppSettings, SettingsTestResult } from "./lib/types";
 
 const DEFAULT_CLAUDE_COMMAND =
-  "npx -y @agentclientprotocol/claude-agent-acp@0.33.1";
-const DEFAULT_CODEX_COMMAND = "npx -y @agentclientprotocol/codex-acp@0.0.44";
+  "npx -y @agentclientprotocol/claude-agent-acp@0.62.0";
+const DEFAULT_CODEX_COMMAND = "npx -y @agentclientprotocol/codex-acp@1.1.7";
 
 const CONNECTORS: { value: AcpConnector; label: string }[] = [
   { value: "claudeCode", label: "Claude Code" },
