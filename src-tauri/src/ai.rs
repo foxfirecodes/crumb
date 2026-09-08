@@ -1,8 +1,9 @@
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::{
-    ContentBlock, ContentChunk, Implementation, InitializeRequest, NewSessionRequest,
-    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionNotification, SessionUpdate, TextContent,
+    ContentBlock, ContentChunk, DeleteSessionRequest, Implementation, InitializeRequest,
+    InitializeResponse, NewSessionRequest, PromptRequest, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
+    SessionNotification, SessionUpdate, TextContent,
 };
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
@@ -18,8 +19,8 @@ use crate::discord::{NormalizedMessage, NormalizedPerson};
 use crate::events::{CanonicalActionItem, Decision};
 use crate::settings::{AcpConnector, AppSettings, SettingsTestResult};
 
-const DEFAULT_CLAUDE_CODE_ACP_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.33.1";
-const DEFAULT_CODEX_ACP_COMMAND: &str = "npx -y @agentclientprotocol/codex-acp@0.0.44";
+const DEFAULT_CLAUDE_CODE_ACP_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.62.0";
+const DEFAULT_CODEX_ACP_COMMAND: &str = "npx -y @agentclientprotocol/codex-acp@1.1.7";
 const ACP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SYSTEM_PROMPT: &str = r#"You are an extraction and reconciliation specialist. You receive a chronological transcript of Discord messages from a single source plus existing records Crumb already knows about from that source. Your job is to identify:
@@ -395,6 +396,7 @@ async fn run_acp_prompt(
     let output = Arc::new(Mutex::new(String::new()));
     let output_for_handler = output.clone();
     let session_meta = acp_session_meta(settings)?;
+    let connector = settings.acp_connector.label();
 
     acp::Client
         .builder()
@@ -423,7 +425,7 @@ async fn run_acp_prompt(
             let prompt = prompt.clone();
             let session_meta = session_meta.clone();
             async move {
-                connection
+                let initialize = connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1).client_info(
                         Implementation::new("crumb", env!("CARGO_PKG_VERSION")).title("Crumb"),
                     ))
@@ -435,13 +437,17 @@ async fn run_acp_prompt(
                     .block_task()
                     .await?;
 
-                connection
+                let session_id = session.session_id.clone();
+                let prompt_result = connection
                     .send_request(PromptRequest::new(
                         session.session_id,
                         vec![ContentBlock::Text(TextContent::new(prompt))],
                     ))
                     .block_task()
-                    .await?;
+                    .await;
+
+                delete_session_if_supported(&connection, &initialize, session_id, connector).await;
+                prompt_result?;
 
                 Ok(())
             }
@@ -495,6 +501,7 @@ pub async fn test_settings(settings: &AppSettings) -> SettingsTestResult {
 async fn test_acp_session(settings: AppSettings) -> Result<()> {
     let agent = build_acp_agent(&settings)?;
     let session_meta = acp_session_meta(&settings)?;
+    let connector = settings.acp_connector.label();
 
     acp::Client
         .builder()
@@ -509,17 +516,25 @@ async fn test_acp_session(settings: AppSettings) -> Result<()> {
         .connect_with(agent, move |connection: acp::ConnectionTo<acp::Agent>| {
             let session_meta = session_meta.clone();
             async move {
-                connection
+                let initialize = connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1).client_info(
                         Implementation::new("crumb", env!("CARGO_PKG_VERSION")).title("Crumb"),
                     ))
                     .block_task()
                     .await?;
 
-                connection
+                let session = connection
                     .send_request(NewSessionRequest::new(agent_workspace()).meta(session_meta))
                     .block_task()
                     .await?;
+
+                delete_session_if_supported(
+                    &connection,
+                    &initialize,
+                    session.session_id,
+                    connector,
+                )
+                .await;
 
                 Ok(())
             }
@@ -529,12 +544,40 @@ async fn test_acp_session(settings: AppSettings) -> Result<()> {
     Ok(())
 }
 
+async fn delete_session_if_supported(
+    connection: &acp::ConnectionTo<acp::Agent>,
+    initialize: &InitializeResponse,
+    session_id: SessionId,
+    connector: &str,
+) {
+    if !supports_session_delete(initialize) {
+        return;
+    }
+
+    if let Err(error) = connection
+        .send_request(DeleteSessionRequest::new(session_id))
+        .block_task()
+        .await
+    {
+        tracing::warn!("{connector} ACP session cleanup failed: {error}");
+    }
+}
+
+fn supports_session_delete(initialize: &InitializeResponse) -> bool {
+    initialize
+        .agent_capabilities
+        .session_capabilities
+        .delete
+        .is_some()
+}
+
 fn build_acp_agent(settings: &AppSettings) -> Result<acp::AcpAgent> {
     let command = selected_acp_command(settings)
         .ok_or_else(|| anyhow!(missing_acp_command_message(settings)))?;
     if command.trim_start().starts_with('{') {
         return acp::AcpAgent::from_str(&command)
-            .with_context(|| format!("parsing ACP command: {command}"));
+            .with_context(|| format!("parsing ACP command: {command}"))
+            .map(with_acp_error_logging);
     }
 
     let env_prefix = acp_agent_env_prefix(settings);
@@ -544,7 +587,17 @@ fn build_acp_agent(settings: &AppSettings) -> Result<acp::AcpAgent> {
         format!("{env_prefix} {command}")
     };
     let command = format!("bash -ic {}", shell_quote(&command));
-    acp::AcpAgent::from_str(&command).with_context(|| format!("parsing ACP command: {command}"))
+    acp::AcpAgent::from_str(&command)
+        .with_context(|| format!("parsing ACP command: {command}"))
+        .map(with_acp_error_logging)
+}
+
+fn with_acp_error_logging(agent: acp::AcpAgent) -> acp::AcpAgent {
+    agent.with_debug(|line, direction| {
+        if direction == acp::LineDirection::Stderr {
+            tracing::warn!("ACP stderr: {line}");
+        }
+    })
 }
 
 fn missing_acp_command_message(settings: &AppSettings) -> &'static str {
@@ -1354,11 +1407,22 @@ mod tests {
 
         assert_eq!(
             selected_acp_command(&settings).as_deref(),
-            Some("npx -y @agentclientprotocol/codex-acp@0.0.44")
+            Some("npx -y @agentclientprotocol/codex-acp@1.1.7")
         );
         assert!(acp_agent_env_prefix(&settings).contains(
             "CODEX_CONFIG='{\"model\":\"gpt-5.4-mini\",\"model_reasoning_effort\":\"low\"}'"
         ));
+    }
+
+    #[test]
+    fn session_delete_requires_advertised_capability() {
+        let unsupported = InitializeResponse::new(ProtocolVersion::V1);
+        assert!(!supports_session_delete(&unsupported));
+
+        let mut supported = InitializeResponse::new(ProtocolVersion::V1);
+        supported.agent_capabilities.session_capabilities.delete =
+            Some(acp::schema::SessionDeleteCapabilities::new());
+        assert!(supports_session_delete(&supported));
     }
 
     #[test]

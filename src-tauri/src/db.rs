@@ -1311,7 +1311,7 @@ fn upsert_canonical_action(
     }
 
     if ai_dedupe_key.is_none() {
-        if let Some(action_id) = find_similar_action_id(tx, source_kind, source_scope, text)? {
+        if let Some(action_id) = find_similar_action_id(tx, source_kind, source_scope, text, url)? {
             update_canonical_action(
                 tx,
                 &action_id,
@@ -1561,6 +1561,7 @@ fn find_similar_action_id(
     source_kind: &str,
     source_scope: &str,
     text: &str,
+    url: Option<&str>,
 ) -> Result<Option<String>> {
     let incoming = action_tokens(text);
     if incoming.len() < 3 {
@@ -1568,18 +1569,25 @@ fn find_similar_action_id(
     }
 
     let mut stmt = tx.prepare(
-        "SELECT id, title FROM canonical_action_items
+        "SELECT id, title, url FROM canonical_action_items
          WHERE source_kind = ? AND source_scope = ?
            AND status IN ('inbox','active','snoozed','done')",
     )?;
     let existing = stmt
         .query_map(rusqlite::params![source_kind, source_scope], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut best: Option<(String, f64)> = None;
-    for (id, title) in existing {
+    for (id, title, existing_url) in existing {
+        if explicit_urls_differ(url, existing_url.as_deref()) {
+            continue;
+        }
         let score = token_similarity(&incoming, &action_tokens(&title));
         if score >= 0.66
             && best
@@ -1633,7 +1641,7 @@ fn merge_similar_canonical_actions(
             if removed.contains(&candidate.0) {
                 continue;
             }
-            if should_skip_pr_outcome_similarity_merge(
+            if should_skip_similarity_merge(
                 &actions[i].1,
                 actions[i].5.as_deref(),
                 &candidate.1,
@@ -1660,19 +1668,17 @@ enum PrActionKind {
     MergeFailure,
 }
 
-fn should_skip_pr_outcome_similarity_merge(
+fn should_skip_similarity_merge(
     left_title: &str,
     left_url: Option<&str>,
     right_title: &str,
     right_url: Option<&str>,
 ) -> bool {
-    let Some(left_url) = left_url else {
-        return false;
-    };
-    let Some(right_url) = right_url else {
-        return false;
-    };
-    if left_url != right_url {
+    if explicit_urls_differ(left_url, right_url) {
+        return true;
+    }
+
+    if left_url.is_none() || right_url.is_none() {
         return false;
     }
 
@@ -1686,6 +1692,10 @@ fn should_skip_pr_outcome_similarity_merge(
             Some(PrActionKind::MergeTodo)
         )
     )
+}
+
+fn explicit_urls_differ(left_url: Option<&str>, right_url: Option<&str>) -> bool {
+    matches!((left_url, right_url), (Some(left), Some(right)) if left != right)
 }
 
 fn pr_action_kind(text: &str) -> Option<PrActionKind> {
@@ -2343,6 +2353,74 @@ mod tests {
         assert_eq!(actions[0].id, action_id);
         assert_eq!(actions[0].status, "inbox");
         assert_eq!(actions[0].completed_at, None);
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn similar_actions_for_different_pr_urls_remain_distinct() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "crumb-distinct-pr-actions-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::open(&db_path)?;
+        db.insert_running(
+            "discord:channel-1",
+            "channel-1",
+            Some("Nelly (DM)"),
+            None,
+            None,
+            "tester",
+        )?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("100"),
+            Some("100"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Resolve merge queue failure for PR #285481".into(),
+                assignee_key: Some("discord:user:fox".into()),
+                assignee: Some("fox".into()),
+                due: None,
+                url: Some("https://github.com/example/repo/pull/285481".into()),
+                message_ids: vec!["100".into()],
+                dedupe_key: Some("resolve-merge-queue-failure-pr-285481".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let old_action_id = db.list_open_action_items()?[0].id.clone();
+        db.set_action_status(&old_action_id, "done")?;
+        db.mark_extracted(
+            "discord:channel-1",
+            Some("101"),
+            Some("101"),
+            1,
+            "summary",
+            &[],
+            &[ActionCandidate {
+                text: "Resolve merge queue failure for PR #303182".into(),
+                assignee_key: Some("discord:user:fox".into()),
+                assignee: Some("fox".into()),
+                due: None,
+                url: Some("https://github.com/example/repo/pull/303182".into()),
+                message_ids: vec!["101".into()],
+                dedupe_key: Some("resolve-merge-queue-failure-pr-303182".into()),
+                merge_with: None,
+            }],
+        )?;
+
+        let open = db.list_open_action_items()?;
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].title, "Resolve merge queue failure for PR #303182");
+        assert_ne!(open[0].id, old_action_id);
+
+        let dismissed = db.list_action_items("dismissed")?;
+        assert_eq!(dismissed.len(), 1);
+        assert_eq!(dismissed[0].id, old_action_id);
 
         let _ = std::fs::remove_file(db_path);
         Ok(())

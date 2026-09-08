@@ -104,7 +104,8 @@ Optional AI settings:
 - Claude Code effort: `low`, `medium`, `high`, or `xhigh`
 - Codex model: `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
 - Codex effort: `low`, `medium`, `high`, or `xhigh`
-- Codex ACP command: defaults to `npx -y @agentclientprotocol/codex-acp@0.0.44`
+- Claude Code ACP command: defaults to `npx -y @agentclientprotocol/claude-agent-acp@0.62.0`
+- Codex ACP command: defaults to `npx -y @agentclientprotocol/codex-acp@1.1.7`
 - Claude config dir: optional path to a separate Claude config/auth directory
 - ACP command: optional alternate ACP-compatible agent command for the selected connector
 

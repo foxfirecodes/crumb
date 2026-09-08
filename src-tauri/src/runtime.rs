@@ -437,20 +437,22 @@ async fn do_scrape(
                 outcome.new_action_count,
                 outcome.source_label.as_deref(),
             );
-            let _ = req
-                .reply
-                .send(format!(
-                    "Done: {} messages, {} decision{}, {} action item{}. Open Crumb to view.",
-                    outcome.message_count,
-                    outcome.decision_count,
-                    if outcome.decision_count == 1 { "" } else { "s" },
-                    outcome.action_count,
-                    if outcome.action_count == 1 { "" } else { "s" }
-                ))
-                .await;
+            let reply = format!(
+                "Done: {} messages, {} decision{}, {} new action item{}. Open Crumb to view.",
+                outcome.message_count,
+                outcome.decision_count,
+                if outcome.decision_count == 1 { "" } else { "s" },
+                outcome.new_action_count,
+                if outcome.new_action_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            let _ = req.reply.send(reply).await;
         }
         Err(e) => {
-            let msg = e.to_string();
+            let msg = error_chain_message(&e);
             let user_msg = user_facing_scrape_error(&msg);
             tracing::error!("scrape failed: {msg}");
             emit_failed(&app, &db, &req.scrape_id, &user_msg);
@@ -522,7 +524,7 @@ async fn do_summarize(
                 .await;
         }
         Err(e) => {
-            let msg = e.to_string();
+            let msg = error_chain_message(&e);
             let user_msg = user_facing_scrape_error(&msg);
             tracing::error!("summarize failed: {msg}");
             let _ = req
@@ -680,8 +682,9 @@ async fn do_watch_poll(
         }
         Ok(None) => {}
         Err(e) => {
-            tracing::error!("watch poll failed for {}: {e}", channel.channel_id);
-            emit_failed(&app, &db, &scrape_id, &e.to_string());
+            let msg = error_chain_message(&e);
+            tracing::error!("watch poll failed for {}: {msg}", channel.channel_id);
+            emit_failed(&app, &db, &scrape_id, &msg);
         }
     }
 }
@@ -689,7 +692,6 @@ async fn do_watch_poll(
 struct ExtractionOutcome {
     message_count: usize,
     decision_count: usize,
-    action_count: usize,
     new_action_count: usize,
     source_label: Option<String>,
 }
@@ -833,7 +835,6 @@ async fn extract_and_store(
     Ok(ExtractionOutcome {
         message_count: messages.len(),
         decision_count: decisions.len(),
-        action_count: action_items.len(),
         new_action_count,
         source_label: Some(source_label_from_summary(&updated)),
     })
@@ -1347,6 +1348,10 @@ fn user_facing_scrape_error(error: &str) -> String {
     error.into()
 }
 
+fn error_chain_message(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
 fn emit_failed(app: &AppHandle, db: &Db, scrape_id: &str, error: &str) {
     match db.mark_failed(scrape_id, error) {
         Ok(updated) => {
@@ -1359,6 +1364,28 @@ fn emit_failed(app: &AppHandle, db: &Db, scrape_id: &str, error: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_chain_message_includes_underlying_acp_error() {
+        let error = anyhow!("ACP protocol version mismatch")
+            .context("opening ACP session")
+            .context("extraction failed");
+
+        assert_eq!(
+            error_chain_message(&error),
+            "extraction failed: opening ACP session: ACP protocol version mismatch"
+        );
+    }
+
+    #[test]
+    fn authentication_errors_are_detected_in_the_full_error_chain() {
+        let error = anyhow!("Authentication required")
+            .context("opening ACP session")
+            .context("extraction failed");
+
+        assert!(user_facing_scrape_error(&error_chain_message(&error))
+            .starts_with("ACP connector authentication is required"));
+    }
 
     #[test]
     fn extracts_canonical_pr_url_from_message_content() {
