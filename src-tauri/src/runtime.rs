@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::async_runtime;
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
@@ -14,7 +15,7 @@ use crate::ai;
 use crate::db::{ActionCandidate, Db, DecisionCandidate, WatchedChannel};
 use crate::discord::{
     DiscordBot, DiscordCommand, DiscordScraper, NormalizedMessage, NormalizedPerson, ScrapeRequest,
-    WatchRequest,
+    SummaryRequest, WatchRequest,
 };
 use crate::events::{CanonicalActionItem, ScrapeSummary, SidecarStatus};
 use crate::settings::AppSettings;
@@ -22,6 +23,8 @@ use crate::settings::AppSettings;
 const WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WATCH_FETCH_LIMIT: usize = 100;
 const TARGETED_MESSAGE_CONTEXT_LIMIT: usize = 11;
+const SCRAPER_CONNECT_ATTEMPTS: usize = 4;
+const SCRAPER_CONNECT_RETRY_BASE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct RuntimeHandle {
@@ -49,6 +52,7 @@ impl RuntimeHandle {
         }
         *self.status.lock() = s.clone();
         let _ = app.emit("sidecar:status", &s);
+        crate::set_tray_runtime_status(app, &s);
     }
 }
 
@@ -132,29 +136,17 @@ async fn run(
     let bot_token = settings.discord_bot_token.clone();
     let app_id = settings.discord_app_id.clone();
 
-    let scraper = match settings.discord_user_token() {
-        Some(token) => match DiscordScraper::connect(token).await {
-            Ok(scraper) => {
-                tracing::info!(
-                    "scraper ready as {}",
-                    scraper.user().as_deref().unwrap_or("unknown")
-                );
-                Some(scraper)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "scraper offline: {e}. /scrape will reject until the Discord user token is valid."
-                );
-                None
-            }
-        },
-        None => {
-            tracing::warn!("no Discord user token provided; /scrape will be rejected");
-            None
-        }
-    };
+    let token = settings
+        .discord_user_token()
+        .ok_or_else(|| anyhow!("Discord user token is required"))?;
+    let scraper = connect_scraper_with_retry(token, shutdown_rx.clone()).await?;
+    tracing::info!(
+        "scraper ready as {}",
+        scraper.user().as_deref().unwrap_or("unknown")
+    );
 
-    let bot = DiscordBot::new(app_id.clone(), bot_token);
+    let owner_user_id = scraper.self_user().id;
+    let bot = DiscordBot::with_owner_user(app_id.clone(), bot_token, Some(owner_user_id));
     bot.register_commands().await?;
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -169,7 +161,7 @@ async fn run(
     handle.set_status(
         SidecarStatus::Connected {
             bot_user: ready.bot_user,
-            self_user: scraper.as_ref().and_then(DiscordScraper::user),
+            self_user: scraper.user(),
         },
         &app,
     );
@@ -185,13 +177,63 @@ async fn run(
         work_tx,
         shutdown_rx.clone(),
     ));
-    work_loop(app.clone(), db, scraper, settings, work_rx, shutdown_rx).await;
+    work_loop(
+        app.clone(),
+        db,
+        Some(scraper),
+        settings,
+        work_rx,
+        shutdown_rx,
+    )
+    .await;
     handle.set_status(SidecarStatus::Disconnected, &app);
     Ok(())
 }
 
+async fn connect_scraper_with_retry(
+    token: String,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<DiscordScraper> {
+    for attempt in 1..=SCRAPER_CONNECT_ATTEMPTS {
+        if *shutdown_rx.borrow() {
+            bail!("runtime shut down while connecting Discord scraper");
+        }
+
+        match DiscordScraper::connect(token.clone()).await {
+            Ok(scraper) => return Ok(scraper),
+            Err(error) if attempt == SCRAPER_CONNECT_ATTEMPTS => {
+                return Err(error).context(format!(
+                    "could not establish the Discord user identity after {attempt} attempts"
+                ));
+            }
+            Err(error) => {
+                let delay = scraper_connect_retry_delay(attempt);
+                tracing::warn!(
+                    "Discord user identity check failed (attempt {attempt}/{SCRAPER_CONNECT_ATTEMPTS}): {error}; retrying in {} seconds",
+                    delay.as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_ok() && *shutdown_rx.borrow() {
+                            bail!("runtime shut down while connecting Discord scraper");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    unreachable!("the final scraper connection attempt always returns")
+}
+
+fn scraper_connect_retry_delay(failed_attempt: usize) -> Duration {
+    SCRAPER_CONNECT_RETRY_BASE * (1_u32 << (failed_attempt - 1))
+}
+
 enum WorkItem {
     Scrape(ScrapeRequest),
+    Summarize(SummaryRequest),
     Watch(WatchRequest),
     Unwatch(WatchRequest),
     Poll(WatchedChannel),
@@ -214,6 +256,7 @@ async fn command_queue_loop(
                 };
                 let item = match command {
                     DiscordCommand::Scrape(req) => WorkItem::Scrape(req),
+                    DiscordCommand::Summarize(req) => WorkItem::Summarize(req),
                     DiscordCommand::Watch(req) => WorkItem::Watch(req),
                     DiscordCommand::Unwatch(req) => WorkItem::Unwatch(req),
                 };
@@ -284,6 +327,7 @@ async fn work_loop(
                 };
                 match item {
                     WorkItem::Scrape(req) => do_scrape(app.clone(), db.clone(), scraper.clone(), settings.clone(), req).await,
+                    WorkItem::Summarize(req) => do_summarize(app.clone(), scraper.clone(), settings.clone(), req).await,
                     WorkItem::Watch(req) => do_watch(db.clone(), scraper.clone(), req).await,
                     WorkItem::Unwatch(req) => do_unwatch(db.clone(), req).await,
                     WorkItem::Poll(channel) => do_watch_poll(app.clone(), db.clone(), scraper.clone(), settings.clone(), channel).await,
@@ -411,6 +455,80 @@ async fn do_scrape(
             tracing::error!("scrape failed: {msg}");
             emit_failed(&app, &db, &req.scrape_id, &user_msg);
             let _ = req.reply.send(format!("Scrape failed: {user_msg}")).await;
+        }
+    }
+}
+
+async fn do_summarize(
+    app: AppHandle,
+    scraper: Option<DiscordScraper>,
+    settings: AppSettings,
+    req: SummaryRequest,
+) {
+    let Some(scraper) = scraper else {
+        let msg = "Summarizer is offline. The Discord user token is missing or rejected. Re-extract it from the Discord web app and restart Crumb.";
+        let _ = req.reply.send(msg).await;
+        return;
+    };
+    let current_user = scraper.self_user();
+    let label = channel_label(
+        req.guild_name.as_deref(),
+        req.channel_name.as_deref(),
+        &req.channel_id,
+    );
+    tracing::info!(
+        "summarizing {} messages from {} for {}",
+        req.limit,
+        label,
+        req.triggered_by
+    );
+
+    let result = async {
+        let messages = scraper
+            .fetch_channel_messages(&req.channel_id, req.limit, |_| {})
+            .await
+            .context("fetching messages for summary")?;
+
+        let _ = req
+            .reply
+            .send(format!(
+                "Summarizing {} message{}...",
+                messages.len(),
+                if messages.len() == 1 { "" } else { "s" }
+            ))
+            .await;
+
+        let markdown = ai::summarize(&messages, Some(&current_user), &settings)
+            .await
+            .context("summarization failed")?;
+        let clipboard_result = app
+            .clipboard()
+            .write_text(markdown.clone())
+            .map_err(|e| e.to_string());
+
+        Ok::<_, anyhow::Error>((markdown, clipboard_result))
+    }
+    .await;
+
+    match result {
+        Ok((markdown, Ok(()))) => {
+            let _ = req.reply.send(summary_reply_content(&markdown, None)).await;
+        }
+        Ok((markdown, Err(e))) => {
+            tracing::warn!("failed to copy summary to clipboard: {e}");
+            let _ = req
+                .reply
+                .send(summary_reply_content(&markdown, Some(&e)))
+                .await;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let user_msg = user_facing_scrape_error(&msg);
+            tracing::error!("summarize failed: {msg}");
+            let _ = req
+                .reply
+                .send(format!("Summarize failed: {user_msg}"))
+                .await;
         }
     }
 }
@@ -762,6 +880,16 @@ fn channel_label(guild_name: Option<&str>, channel_name: Option<&str>, channel_i
         (Some(guild), None) => format!("{guild} / {channel_id}"),
         (None, None) => channel_id.to_string(),
     }
+}
+
+fn summary_reply_content(markdown: &str, clipboard_error: Option<&str>) -> String {
+    let escaped = markdown.replace("```", "'''");
+    let status = if clipboard_error.is_some() {
+        "Summary generated, but clipboard copy failed."
+    } else {
+        "Copied to clipboard."
+    };
+    format!("{status}\n```md\n{escaped}\n```")
 }
 
 fn source_label_from_summary(summary: &ScrapeSummary) -> String {
@@ -1686,6 +1814,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["101"]
         );
+    }
+
+    #[test]
+    fn summary_reply_wraps_markdown_and_escapes_nested_fences() {
+        let reply = summary_reply_content("Conclusion\n```oops```\n\nAction items\nNone.", None);
+
+        assert!(reply.starts_with("Copied to clipboard.\n```md\nConclusion"));
+        assert!(reply.ends_with("\n```"));
+        assert!(reply.contains("'''oops'''"));
+    }
+
+    #[test]
+    fn scraper_connection_retries_with_exponential_backoff() {
+        assert_eq!(scraper_connect_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(scraper_connect_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(scraper_connect_retry_delay(3), Duration::from_secs(4));
     }
 
     fn message(id: &str, content: &str) -> NormalizedMessage {

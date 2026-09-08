@@ -38,16 +38,13 @@ By proceeding, you accept the risk for your own account.
 This is the new (post–2024) Discord feature that lets a slash command run anywhere you can see, without being added to a server.
 
 1. In your app's settings, go to **Installation**.
-2. Under **Installation Contexts**, enable both:
+2. Under **Installation Contexts**, enable:
    - ✅ **User Install**
-   - ✅ **Guild Install** (optional — only if you also want to add it to specific servers)
+   - Leave **Guild Install** disabled. Crumb is a local assistant for the configured Discord user; its commands are registered for user installs and the runtime rejects interactions from any other Discord account.
 3. Under **Install Link**, choose **Discord Provided Link**. Save the resulting URL — you'll use it to install the app to your account in step 1.5.
 4. Under **Default Install Settings → User Install**:
    - **Scopes:** `applications.commands`
    - (No bot scope needed for user install — the slash command is delivered to the bot via its gateway connection, but the install itself is permission-free.)
-5. Under **Default Install Settings → Guild Install** (if enabled):
-   - **Scopes:** `applications.commands`, `bot`
-   - **Permissions:** `Send Messages`, `Read Message History`
 
 ### 1.3 Create the bot
 
@@ -86,7 +83,7 @@ On the General Information page there's also a **Public Key**. We don't need it 
 
 ### 2.2 Rotate when needed
 
-If you ever change your Discord password, this token is invalidated and you'll need to re-extract it. Crumb will surface a clear error in the menubar when authentication fails.
+If you ever change your Discord password, this token is invalidated and you'll need to re-extract it. Crumb retries the identity check briefly, then stops its Discord runtime and shows an X on the tray icon until you save corrected settings or relaunch the app.
 
 ---
 

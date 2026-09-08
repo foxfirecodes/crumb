@@ -282,6 +282,9 @@ impl AppSettings {
         if self.discord_bot_token.trim().is_empty() {
             missing.push("Bot token".into());
         }
+        if self.discord_user_token.trim().is_empty() {
+            missing.push("User token".into());
+        }
         missing
     }
 
@@ -583,5 +586,16 @@ mod tests {
             normalize_acp_command("zsh -lc \"codex-acp --flag\""),
             "codex-acp --flag"
         );
+    }
+
+    #[test]
+    fn user_token_is_required_to_start_the_discord_runtime() {
+        let settings = AppSettings {
+            discord_app_id: "123".into(),
+            discord_bot_token: "bot".into(),
+            ..AppSettings::default()
+        };
+
+        assert_eq!(settings.missing_runtime_fields(), vec!["User token"]);
     }
 }
